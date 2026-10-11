@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Права окон VORTEX. Управление окнами (fullscreen, always-on-top, создание окна вывода) выполняется на стороне Rust через собственные команды, поэтому из JS достаточно базового набора: события (listen/emit) и метаданные окна.",
+  "windows": ["main", "output"],
+  "permissions": ["core:default"]
+}

@@ -1,0 +1,18 @@
+[package]
+name = "vortex-core"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.77"
+publish = false
+description = "Чистая логика Vortex: FFT-анализ звука, diff таблиц соединений, дерево диска. Без зависимостей от Windows/Tauri."
+
+[lib]
+name = "vortex_core"
+path = "src/lib.rs"
+
+[dependencies]
+# FFT для аудиовизуализатора. rustfft даёт автовыбор SIMD (AVX2/SSE) на x86_64.
+rustfft = "6.2"
+
+[dev-dependencies]
+# Тесты работают на любой ОС: ядро не знает про Windows API.

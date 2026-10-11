@@ -1,0 +1,266 @@
+/* Глобальные стили VORTEX: тёмная сцена, стеклянный HUD, неоновые акценты. */
+
+:root {
+  --bg: #04060c;
+  --bg-soft: #070b14;
+  --panel: rgba(12, 18, 32, 0.62);
+  --panel-strong: rgba(10, 15, 26, 0.86);
+  --stroke: rgba(120, 200, 255, 0.16);
+  --stroke-strong: rgba(140, 220, 255, 0.34);
+  --text: #e8f2ff;
+  --text-dim: #8fa3bd;
+  --text-faint: #5d6f88;
+  --cyan: #22d3ee;
+  --violet: #a78bfa;
+  --pink: #f472b6;
+  --amber: #fbbf24;
+  --green: #34d399;
+  --red: #fb7185;
+  --shadow: 0 18px 60px rgba(0, 0, 0, 0.55);
+  --radius: 14px;
+  --font-ui: "Inter", "Segoe UI Variable", "Segoe UI", system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", "Cascadia Mono", ui-monospace, "SFMono-Regular", monospace;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  height: 100%;
+  overflow: hidden;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-ui);
+  font-size: 14px;
+  -webkit-font-smoothing: antialiased;
+  user-select: none;
+  cursor: default;
+}
+
+#viewport {
+  position: fixed;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  display: block;
+  touch-action: none;
+}
+
+#hud-root {
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 10;
+}
+
+#hud-root.hud-hidden > *:not(.hud-toasts) {
+  opacity: 0;
+  pointer-events: none !important;
+}
+
+/* ── Экран загрузки ─────────────────────────────────────────────── */
+
+#boot {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+  display: grid;
+  place-content: center;
+  justify-items: center;
+  gap: 14px;
+  background: radial-gradient(circle at 50% 45%, #0a1526 0%, #04060c 60%);
+  transition: opacity 0.6s ease, visibility 0.6s;
+}
+
+#boot.hidden {
+  opacity: 0;
+  visibility: hidden;
+}
+
+.boot-mark {
+  width: 68px;
+  height: 68px;
+  border-radius: 50%;
+  border: 2px solid rgba(34, 211, 238, 0.35);
+  border-top-color: var(--cyan);
+  border-right-color: var(--violet);
+  animation: boot-spin 1.1s linear infinite;
+  box-shadow: 0 0 42px rgba(34, 211, 238, 0.35);
+}
+
+.boot-text {
+  font-family: var(--font-mono);
+  letter-spacing: 0.42em;
+  font-size: 15px;
+  color: var(--text);
+}
+
+.boot-sub {
+  color: var(--text-faint);
+  font-size: 12px;
+}
+
+@keyframes boot-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* ── Общие элементы HUD ─────────────────────────────────────────── */
+
+.hud-panel {
+  background: var(--panel);
+  border: 1px solid var(--stroke);
+  border-radius: var(--radius);
+  backdrop-filter: blur(18px) saturate(140%);
+  box-shadow: var(--shadow);
+}
+
+.hud-btn {
+  pointer-events: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  height: 32px;
+  padding: 0 12px;
+  border-radius: 10px;
+  border: 1px solid var(--stroke);
+  background: rgba(16, 24, 40, 0.6);
+  color: var(--text-dim);
+  font: inherit;
+  font-size: 12.5px;
+  cursor: pointer;
+  transition: color 0.18s, border-color 0.18s, background 0.18s, transform 0.18s;
+}
+
+.hud-btn:hover {
+  color: var(--text);
+  border-color: var(--stroke-strong);
+  background: rgba(24, 36, 58, 0.72);
+}
+
+.hud-btn:active {
+  transform: translateY(1px);
+}
+
+.hud-btn.active {
+  color: #04121a;
+  background: linear-gradient(180deg, #7ee7fb, var(--cyan));
+  border-color: transparent;
+  font-weight: 600;
+  box-shadow: 0 6px 24px rgba(34, 211, 238, 0.35);
+}
+
+.hud-btn.danger:hover {
+  color: #fff;
+  border-color: rgba(251, 113, 133, 0.6);
+  background: rgba(120, 20, 40, 0.5);
+}
+
+.hud-mono {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+.hud-label {
+  color: var(--text-faint);
+  font-size: 10.5px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+}
+
+.hud-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.hud-scroll {
+  overflow-y: auto;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(120, 200, 255, 0.25) transparent;
+}
+
+.hud-scroll::-webkit-scrollbar {
+  width: 8px;
+}
+
+.hud-scroll::-webkit-scrollbar-thumb {
+  background: rgba(120, 200, 255, 0.22);
+  border-radius: 8px;
+}
+
+/* Ползунки настроек */
+.hud-slider {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 100%;
+  height: 3px;
+  border-radius: 3px;
+  background: linear-gradient(90deg, rgba(34, 211, 238, 0.7), rgba(167, 139, 250, 0.7));
+  outline: none;
+  pointer-events: auto;
+}
+
+.hud-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 13px;
+  height: 13px;
+  border-radius: 50%;
+  background: #0b1220;
+  border: 2px solid var(--cyan);
+  box-shadow: 0 0 12px rgba(34, 211, 238, 0.6);
+  cursor: pointer;
+}
+
+.hud-switch {
+  pointer-events: auto;
+  width: 38px;
+  height: 20px;
+  border-radius: 20px;
+  border: 1px solid var(--stroke);
+  background: rgba(16, 24, 40, 0.7);
+  position: relative;
+  cursor: pointer;
+  transition: background 0.2s, border-color 0.2s;
+  flex: none;
+}
+
+.hud-switch::after {
+  content: "";
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--text-faint);
+  transition: transform 0.2s, background 0.2s;
+}
+
+.hud-switch.on {
+  background: rgba(34, 211, 238, 0.22);
+  border-color: rgba(34, 211, 238, 0.6);
+}
+
+.hud-switch.on::after {
+  transform: translateX(18px);
+  background: var(--cyan);
+  box-shadow: 0 0 12px rgba(34, 211, 238, 0.8);
+}
+
+.hud-kbd {
+  display: inline-block;
+  min-width: 20px;
+  padding: 1px 5px;
+  border-radius: 5px;
+  border: 1px solid var(--stroke);
+  background: rgba(10, 16, 28, 0.8);
+  color: var(--text-dim);
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  text-align: center;
+}

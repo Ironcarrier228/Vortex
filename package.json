@@ -1,0 +1,29 @@
+{
+  "name": "vortex",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Vortex — 3D-центр визуализации данных (Tauri + three.js)",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit",
+    "tauri": "tauri",
+    "app:dev": "tauri dev",
+    "app:build": "tauri build",
+    "smoke": "esbuild tools/smoke.test.ts --bundle --format=esm --platform=node --outfile=node_modules/.vortex-smoke.mjs --log-level=warning && node node_modules/.vortex-smoke.mjs",
+    "check": "npm run typecheck && npm run smoke"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "2.12.3",
+    "d3-force-3d": "3.0.6",
+    "three": "^0.186.0"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "2.12.2",
+    "@types/three": "^0.186.0",
+    "typescript": "^5.9.0",
+    "vite": "^7.0.0"
+  }
+}

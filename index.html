@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <meta name="color-scheme" content="dark" />
+    <title>Vortex — 3D центр визуализации</title>
+  </head>
+  <body>
+    <canvas id="viewport"></canvas>
+    <div id="hud-root"></div>
+
+    <div id="boot">
+      <div class="boot-mark"></div>
+      <div class="boot-text">VORTEX</div>
+      <div class="boot-sub">инициализация рендер-слоя…</div>
+    </div>
+
+    <noscript>Для работы Vortex нужен JavaScript (WebView2).</noscript>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

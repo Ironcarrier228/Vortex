@@ -1,0 +1,27 @@
+# node / vite
+node_modules/
+dist/
+dist-ssr/
+.vite/
+*.local
+
+# rust / tauri
+target/
+src-tauri/target/
+src-tauri/gen/
+**/*.rs.bk
+Cargo.lock.orig
+
+# локальные данные GeoIP (лицензия запрещает коммитить базу)
+assets/geoip/*.mmdb
+assets/geoip/*.mmdb.gz
+
+# кэш сканирования диска
+*.vortex-cache.json
+
+# ide / os
+.vscode/*
+!.vscode/extensions.json
+.idea/
+.DS_Store
+Thumbs.db
