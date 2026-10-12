@@ -38,6 +38,24 @@ export interface Prefs {
   networkPollMs: number;
 
   diskColorBy: 'category' | 'depth' | 'age';
+
+  /* ── Управление жестами (веб-камера) ── */
+  /** Распознавание рук включено (камера). */
+  handEnabled: boolean;
+  /** Синтетическая рука вместо камеры: демонстрация и отладка жестов. */
+  handDemo: boolean;
+  /** Зеркалить по горизонтали: движение руки «как в зеркале». */
+  handMirror: boolean;
+  /** Рисовать скелет кисти и курсор. */
+  handShowSkeleton: boolean;
+  /** Показывать превью камеры в углу. */
+  handShowPreview: boolean;
+  /** Усиление движения: рукой в воздухе можно управлять всем экраном. */
+  handSensitivity: number;
+  /** Сглаживание курсора 0…0.95 (One Euro Filter). */
+  handSmoothing: number;
+  /** Пауза жестом открытой ладони (удержание). */
+  handPauseGesture: boolean;
 }
 
 export const DEFAULT_PREFS: Prefs = {
@@ -70,6 +88,15 @@ export const DEFAULT_PREFS: Prefs = {
   networkPollMs: 2000,
 
   diskColorBy: 'category',
+
+  handEnabled: false, // камера включается осознанно: либо кнопкой, либо ?hand=1 в адресе
+  handDemo: false,
+  handMirror: true,
+  handShowSkeleton: true,
+  handShowPreview: false,
+  handSensitivity: 1.2,
+  handSmoothing: 0.55,
+  handPauseGesture: true,
 };
 
 const STORAGE_KEY = 'vortex.prefs.v1';

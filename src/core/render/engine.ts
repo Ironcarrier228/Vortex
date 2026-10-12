@@ -82,6 +82,8 @@ export class Engine {
 
   onSceneChange: ((id: SceneId) => void) | null = null;
 
+  #frameHooks: ((dt: number, time: number) => void)[] = [];
+
   constructor(canvas: HTMLCanvasElement, prefs: PrefsStore, audio: AudioBus) {
     this.#canvas = canvas;
     this.#prefs = prefs;
@@ -206,6 +208,18 @@ export class Engine {
     window.addEventListener('resize', this.#onResize);
   }
 
+  /**
+   * Хук, вызываемый в начале каждого отрисованного кадра, до обновления сцен.
+   * Через него подключается слой жестов: сцены должны видеть уже актуальный курсор.
+   */
+  addFrameHook(hook: (dt: number, time: number) => void): () => void {
+    this.#frameHooks.push(hook);
+    return () => {
+      const index = this.#frameHooks.indexOf(hook);
+      if (index >= 0) this.#frameHooks.splice(index, 1);
+    };
+  }
+
   /** Перерисовать кадр (после смены настроек, размера и т.п.). */
   invalidate(): void {
     this.#dirty = true;
@@ -280,6 +294,7 @@ export class Engine {
       this.#time += dt;
 
       this.#audio.update(dt);
+      for (const hook of this.#frameHooks) hook(dt, this.#time);
       this.#updateTransition(dt);
       this.#updateScenes(dt, idle);
 

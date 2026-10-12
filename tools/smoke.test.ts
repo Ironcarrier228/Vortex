@@ -8,12 +8,26 @@
  */
 
 // Node-харнесс: мок-бэкенд использует window.setInterval, как и в браузере.
-const globals = globalThis as unknown as { window?: typeof globalThis };
+const globals = globalThis as unknown as {
+  window?: typeof globalThis;
+  requestAnimationFrame?: (cb: (time: number) => void) => number;
+  cancelAnimationFrame?: (handle: number) => void;
+};
 if (!globals.window) globals.window = globalThis;
+// Демо-источник рук рассчитан на браузерный цикл кадров: в Node подменяем его таймером.
+if (!globals.requestAnimationFrame) {
+  globals.requestAnimationFrame = (cb) => setTimeout(() => cb(performance.now()), 16) as unknown as number;
+  globals.cancelAnimationFrame = () => undefined;
+}
 
 import { installMockBackend } from '../src/core/mock/backend';
 import { AudioBus } from '../src/core/audio/bus';
 import { invoke, listen } from '../src/core/transport';
+import { PINCH_ENTER, PINCH_EXIT, classifyPose, makeSyntheticHand, pinchRatio } from '../src/core/gesture/landmarks';
+import { GestureController } from '../src/core/gesture/gestureController';
+import { DemoHandSource } from '../src/core/gesture/demoHand';
+import { PointerHub } from '../src/core/interaction/pointer';
+import type { HandFrame, Landmark } from '../src/core/gesture/types';
 import type { DiskNodeInfo, NetSnapshot } from '../src/core/types';
 
 let failures = 0;
@@ -89,6 +103,138 @@ async function main(): Promise<void> {
 
   const emptyRoot = await invoke<DiskNodeInfo[]>('disk_children', { path: 'Z:\\nope' });
   check(Array.isArray(emptyRoot) && emptyRoot.length === 0, 'несуществующий путь даёт пустой список, а не падение');
+
+  console.log('Жесты: геометрия кисти (21 точка, нормировка на размер кисти)');
+  const openHand = makeSyntheticHand({ centerX: 0.5, centerY: 0.5, size: 0.22, openness: 1 });
+  const fistHand = makeSyntheticHand({ centerX: 0.5, centerY: 0.5, size: 0.22, openness: 0 });
+  const pinchHand = makeSyntheticHand({ centerX: 0.5, centerY: 0.5, size: 0.22, pinch: 1 });
+  const thumbsHand = makeSyntheticHand({ centerX: 0.5, centerY: 0.5, size: 0.22, thumbsUp: true });
+  const smallPinch = makeSyntheticHand({ centerX: 0.5, centerY: 0.5, size: 0.12, pinch: 1 });
+
+  check(openHand.length === 21 && fistHand.length === 21, `синтетическая кисть даёт 21 точку (${openHand.length})`);
+  check(
+    openHand.every((point) => point.x > 0 && point.x < 1 && point.y > 0 && point.y < 1),
+    'точки лежат в кадре 0..1',
+  );
+  check(pinchRatio(pinchHand) < PINCH_ENTER, `щипок опознан по отношению (${pinchRatio(pinchHand).toFixed(2)})`);
+  check(pinchRatio(openHand) > PINCH_EXIT, `раскрытая кисть не щипок (${pinchRatio(openHand).toFixed(2)})`);
+  check(
+    pinchRatio(smallPinch) < PINCH_ENTER,
+    `порог щипка не зависит от размера кисти (${pinchRatio(smallPinch).toFixed(2)})`,
+  );
+  check(classifyPose(fistHand, false) === 'fist', `классификация: кулак (${classifyPose(fistHand, false)})`);
+  check(classifyPose(openHand, false) === 'open', `классификация: ладонь (${classifyPose(openHand, false)})`);
+  check(classifyPose(pinchHand, true) === 'pinch', 'классификация: щипок');
+  check(
+    classifyPose(thumbsHand, false) === 'thumbsUp',
+    `классификация: большой палец вверх (${classifyPose(thumbsHand, false)})`,
+  );
+
+  console.log('Жесты: контроллер (кадры распознавания 30 Гц + кадры рендера 60 Гц)');
+  const seen: string[] = [];
+  const controller = new GestureController({ mirror: false, sensitivity: 1.2, smoothing: 0.5, pauseGesture: true });
+  for (const name of ['swipe-left', 'swipe-right', 'palm-pause', 'fist-reset', 'thumbs-up', 'hand-lost'] as const) {
+    controller.on(name, () => seen.push(name));
+  }
+
+  const step = 1 / 60;
+  const frame = (landmarks: Landmark[], time: number): HandFrame => ({
+    hands: [{ landmarks, handedness: 'Right', score: 0.95 }],
+    timestampMs: time * 1000,
+    inferenceMs: 3,
+  });
+
+  let clock = 0;
+  const run = (landmarks: Landmark[], frames: number): void => {
+    for (let i = 0; i < frames; i++) {
+      clock += step;
+      if (i % 2 === 0) controller.push(frame(landmarks, clock));
+      controller.update(step);
+    }
+  };
+
+  run(openHand, 40);
+  check(controller.state.cursor.active, 'курсор руки активен после потока кадров');
+  check(
+    Math.abs(controller.state.cursor.ndcX) <= 1.15 && Math.abs(controller.state.cursor.ndcY) <= 1.15,
+    `курсор в пределах NDC (${controller.state.cursor.ndcX.toFixed(2)}; ${controller.state.cursor.ndcY.toFixed(2)})`,
+  );
+
+  run(pinchHand, 30);
+  check(controller.state.pinch.active, 'щипок включился (гистерезис входа)');
+  check(controller.state.pose === 'pinch', `поза щипка видна сценам (${controller.state.pose})`);
+  controller.setGrabbed(true);
+  check(controller.state.grabbed, 'сцена может сообщить о захвате объекта щипком');
+  controller.setGrabbed(false);
+
+  run(openHand, 30);
+  check(!controller.state.pinch.active, 'щипок выключился после раскрытия пальцев');
+
+  // Свайп: сначала медленно подводим ладонь к левому краю (скорость ниже порога —
+  // это не свайп), даём фильтру успокоиться и только потом делаем быстрый мах вправо.
+  const leftHand = makeSyntheticHand({ centerX: 0.22, centerY: 0.5, size: 0.22, openness: 1 });
+  for (let i = 1; i <= 40; i++) {
+    clock += step;
+    const x = 0.5 - (i / 40) * 0.28;
+    controller.push(frame(makeSyntheticHand({ centerX: x, centerY: 0.5, size: 0.22, openness: 1 }), clock));
+    controller.update(step);
+  }
+  // Пауза в той же точке: гасим инерцию фильтра и кулдауны — мах должен считаться «с нуля».
+  run(leftHand, 70);
+  seen.length = 0;
+  for (let i = 0; i <= 12; i++) {
+    clock += step;
+    const x = 0.22 + (i / 12) * 0.7;
+    controller.push(frame(makeSyntheticHand({ centerX: x, centerY: 0.5, size: 0.22, openness: 1 }), clock));
+    controller.update(step);
+  }
+  check(seen.includes('swipe-right'), `свайп вправо распознан (${seen.join(', ') || 'нет событий'})`);
+
+  // «Класс»: удержание большого пальца вверх около секунды.
+  seen.length = 0;
+  run(thumbsHand, 90);
+  check(seen.includes('thumbs-up'), `«класс» по удержанию распознан (${seen.join(', ') || 'нет событий'})`);
+
+  // Потеря руки: кадры прекращаются, курсор должен погаснуть.
+  clock += 0.6;
+  controller.update(0.6);
+  check(!controller.state.cursor.active, 'без кадров курсор гаснет (hand-lost)');
+  check(seen.includes('hand-lost'), 'сцена получает событие hand-lost');
+
+  console.log('Жесты: демо-источник (превью без камеры)');
+  const demo = new DemoHandSource();
+  const demoFrames: HandFrame[] = [];
+  const demoOff = demo.onFrame((item) => demoFrames.push(item));
+  await demo.start();
+  await wait(450);
+  demo.stop();
+  demoOff();
+  check(demoFrames.length >= 6, `демо-рука выдаёт кадры ~30 Гц (${demoFrames.length} за 450 мс)`);
+  check(
+    demoFrames.every((item) => item.hands.length === 0 || item.hands[0].landmarks.length === 21),
+    'в кадрах демо-руки по 21 точке',
+  );
+
+  console.log('Указатель: мышь и рука — один интерфейс для сцен');
+  const hub = new PointerHub();
+  const hubEvents: string[] = [];
+  hub.onPress(() => hubEvents.push('press'));
+  hub.onRelease(() => hubEvents.push('release'));
+  hub.onClick(() => hubEvents.push('click'));
+  hub.setHandPointer(-0.4, 0.3, true);
+  check(hub.state.source === 'hand', 'источник указателя — рука');
+  check(Math.abs(hub.state.ndcX + 0.4) < 1e-6, 'курсор руки доходит до сцен в NDC');
+  hub.setHandPress(true);
+  check(hub.state.pressed, 'щипок = нажатие указателя');
+  hub.setHandPress(false);
+  await wait(20);
+  check(hubEvents.join(',') === 'press,release,click', `короткий щипок даёт клик по объекту (${hubEvents.join(', ')})`);
+  hub.setHandPress(true);
+  await wait(760);
+  hub.setHandPress(false);
+  check(!hubEvents.slice(3).includes('click'), 'долгий щипок — это перетаскивание, а не клик');
+  hub.clearHand();
+  check(!hub.state.active && hub.state.source === null, 'рука ушла из кадра — указатель снят');
 
   console.log(failures === 0 ? '\nВсе проверки пройдены ✅' : `\nПровалено проверок: ${failures} ❌`);
   process.exit(failures === 0 ? 0 : 1);

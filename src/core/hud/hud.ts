@@ -12,6 +12,8 @@ import type { Engine } from '../render/engine';
 
 export interface AppHost {
   setScene(id: SceneId): void;
+  /** Включить/выключить распознавание рук (клавиша G, кнопка HUD). */
+  toggleHands(): void;
   currentScene(): SceneId;
   setMode(mode: AudioModeId): void;
   togglePause(): void;
@@ -26,6 +28,9 @@ export interface AppHost {
     sourceLabel: string;
     sceneTitle: string;
     modeLabel: string;
+    paused: boolean;
+    hudVisible: boolean;
+    hands: boolean;
   };
 }
 
@@ -122,6 +127,7 @@ export class Hud {
     actions.appendChild(this.#actionButton('⚙', 'Настройки (S)', () => this.#host.toggleSettings(), 'settings'));
     actions.appendChild(this.#actionButton('⧉', 'Окно вывода (W)', () => this.#host.toggleOutputWindow(), 'output'));
     actions.appendChild(this.#actionButton('⛶', 'Полный экран (F)', () => this.#host.toggleFullscreen(), 'fullscreen'));
+    actions.appendChild(this.#actionButton('✋', 'Управление жестами (G)', () => this.#host.toggleHands(), 'hands'));
     actions.appendChild(this.#actionButton('▣', 'Скрыть HUD (H)', () => this.#host.toggleHud(), 'hud'));
     top.appendChild(actions);
     this.root.appendChild(top);
@@ -151,6 +157,10 @@ export class Hud {
       '<span><span class="hud-kbd">W</span> вывод</span>',
       '<span class="sep">·</span>',
       '<span><span class="hud-kbd">F</span> фullscreen</span>',
+      '<span class="sep">·</span>',
+      '<span><span class="hud-kbd">G</span> жесты</span>',
+      '<span class="sep">·</span>',
+      '<span data-role="hands" class="hud-label">жесты выключены</span>',
     ].join('');
     this.root.appendChild(this.#hintEl);
 
@@ -261,6 +271,27 @@ export class Hud {
       ['60', '60'],
       ['30', '30'],
     ]));
+
+    category('Управление жестами (веб-камера)');
+    inner.appendChild(
+      this.#switchField('Распознавание рук', 'handEnabled', () => this.#host.toggleHands()),
+    );
+    inner.appendChild(this.#switchField('Демо-рука (без камеры)', 'handDemo'));
+    inner.appendChild(this.#switchField('Зеркалить движение', 'handMirror'));
+    inner.appendChild(this.#switchField('Показывать скелет кисти', 'handShowSkeleton'));
+    inner.appendChild(this.#switchField('Превью камеры', 'handShowPreview'));
+    inner.appendChild(this.#switchField('Пауза ладонью', 'handPauseGesture'));
+    inner.appendChild(this.#sliderField('Усиление движения', 'handSensitivity', 0.6, 2.5, 0.05));
+    inner.appendChild(this.#sliderField('Сглаживание', 'handSmoothing', 0, 0.95, 0.05));
+    inner.appendChild(
+      el(
+        'div',
+        'hud-label',
+        'Щипок двумя пальцами — взять узел и перетащить. Ладонь (удержание) — пауза, ' +
+          'кулак — сброс вида, свайп — смена сцены, большой палец вверх — действие сцены, ' +
+          'две руки — зум и поворот.',
+      ),
+    );
 
     category('Аудио');
     inner.appendChild(this.#switchField('Автозапуск захвата', 'audioAutoStart'));
@@ -382,6 +413,9 @@ export class Hud {
         case 'Digit3':
           this.#host.setScene('disk');
           break;
+        case 'KeyG':
+          this.#host.toggleHands();
+          break;
         case 'KeyM': {
           const module = this.#engine.currentModule;
           module?.onKey?.('KeyM');
@@ -454,6 +488,21 @@ export class Hud {
     const stats = this.#engine.stats;
     if (resolution) resolution.textContent = `${stats.width}×${stats.height} @${stats.pixelRatio.toFixed(2)}`;
     this.#hintEl.dataset.scene = `${info.sceneTitle} · ${info.modeLabel}`;
+
+    const handsButton = this.root.querySelector<HTMLButtonElement>('[data-action="hands"]');
+    handsButton?.classList.toggle('active', info.hands);
+  }
+
+  /**
+   * Строка состояния распознавания рук: «жесты · 30 FPS · GPU · рук: 1 · щипок · захват».
+   * `kind` управляет цветом: ok — работает, error — сломалось.
+   */
+  setHandStatus(text: string, kind: 'ok' | 'error' | '' = ''): void {
+    const node = this.#hintEl.querySelector<HTMLElement>('[data-role="hands"]');
+    if (!node || node.textContent === text) return;
+    node.textContent = text;
+    node.classList.toggle('hud-hands-ok', kind === 'ok');
+    node.classList.toggle('hud-hands-error', kind === 'error');
   }
 
   /** Обновление панели статистики (вызывается из app-цикла ~4 раза в секунду). */

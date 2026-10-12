@@ -2,7 +2,7 @@
  * Точка входа VORTEX.
  *
  * Приложение собирается как `App`, который:
- *  • создаёт рендер-ядро, HUD и аудиошину;
+ *  • создаёт рендер-ядро, HUD, аудиошину и слой жестов;
  *  • регистрирует независимые модули сцен;
  *  • связывает настройки, горячие клавиши и события бэкенда;
  *  • умеет работать в режиме «окно вывода» — без HUD, для второго монитора.
@@ -15,6 +15,8 @@ import { PrefsStore, type AudioModeId, type SceneId } from './core/prefs';
 import { AudioBus } from './core/audio/bus';
 import { Engine } from './core/render/engine';
 import { Hud, type AppHost } from './core/hud/hud';
+import { PointerHub } from './core/interaction/pointer';
+import { GestureService, statusLabel } from './core/gesture';
 import { installMockBackend } from './core/mock/backend';
 import { AudioScene } from './scenes/audio/audioScene';
 import { NetworkScene } from './scenes/network/networkScene';
@@ -27,6 +29,9 @@ const EV_SCENE_CHANGE = 'vortex://scene/change';
 class App implements AppHost {
   readonly prefs = new PrefsStore();
   readonly outputMode: boolean;
+  readonly pointer = new PointerHub();
+  readonly gesture: GestureService;
+
   #audio = new AudioBus();
   #engine: Engine;
   #hud: Hud;
@@ -34,15 +39,20 @@ class App implements AppHost {
   #sys: SysInfo | null = null;
   #unlisteners: (() => void)[] = [];
   #booted = false;
+  #lastGestureStatus = '';
+  #lastTwoHandScale = 1;
 
-  constructor(canvas: HTMLCanvasElement, outputMode: boolean) {
+  constructor(canvas: HTMLCanvasElement, outputMode: boolean, params: URLSearchParams) {
     this.outputMode = outputMode;
+    this.pointer.attach(canvas);
     this.#engine = new Engine(canvas, this.prefs, this.#audio);
 
     const context: SceneContext = {
       audio: this.#audio,
       prefs: this.prefs,
       mode: outputMode ? 'output' : 'main',
+      pointer: this.pointer,
+      gesture: (this.gesture = new GestureService({ prefs: this.prefs, pointer: this.pointer })),
       hud: (this.#hud = new Hud(
         outputMode ? document.createElement('div') : document.getElementById('hud-root')!,
         this.#engine,
@@ -64,6 +74,13 @@ class App implements AppHost {
     this.#engine.onSceneChange = (id) => this.#handleSceneChange(id);
     this.#handleSceneChange(this.#engine.currentId ?? this.prefs.get().scene);
 
+    // Слой жестов обновляется ДО сцен: сцены должны видеть актуальный курсор в этом же кадре.
+    this.#engine.addFrameHook((dt) => {
+      this.gesture.update(dt);
+      this.#applyTwoHandControl();
+      this.#syncGestureStatus();
+    });
+
     this.#unlisteners.push(
       listen<Toast>('vortex://toast', (toast) => this.#hud.toast(toast.kind, toast.message)),
       listen<SysInfo>('vortex://sys/info', (info) => {
@@ -74,11 +91,14 @@ class App implements AppHost {
         // Окно вывода следует за главным.
         if (outputMode && payload?.scene) this.setScene(payload.scene);
       }),
-      this.prefs.subscribe(() => {
+      this.prefs.subscribe((prefs, changed) => {
         this.#hud.refresh();
         this.#engine.invalidate();
+        if (changed.includes('paused')) this.#syncGesturePause(prefs.paused);
       }),
     );
+
+    this.#wireGestures(params);
 
     if (outputMode) {
       document.getElementById('boot')?.classList.add('hidden');
@@ -86,37 +106,106 @@ class App implements AppHost {
     }
   }
 
-  /** Пересобрать панель активной сцены и синхронизировать окно вывода. */
-  #handleSceneChange(id: SceneId): void {
-    this.#hud.setScenePanel(this.#scenes.get(id)?.hudPanel?.() ?? null);
-    this.#hud.refresh();
-    if (this.outputMode || !isTauri) return;
-    // Событие уходит во все окна приложения, включая окно вывода.
-    void import('@tauri-apps/api/event').then(({ emit }) => emit(EV_SCENE_CHANGE, { scene: id }));
+  /* ─────────────────────────── Жесты ─────────────────────────── */
+
+  /**
+   * Связка жестов с приложением:
+   *  • свайп ладонью → соседняя сцена (с уже готовым «пролётом» камеры);
+   *  • открытая ладонь (удержание) → пауза;
+   *  • кулак (удержание) → сброс камеры/раскладки сцены;
+   *  • большой палец вверх → действие в контексте сцены.
+   */
+  #wireGestures(params: URLSearchParams): void {
+    const ORDER: SceneId[] = ['audio', 'network', 'disk'];
+
+    this.gesture.onEvent((name) => {
+      if (this.outputMode) return;
+      switch (name) {
+        case 'swipe-right': {
+          const index = ORDER.indexOf(this.currentScene());
+          this.setScene(ORDER[(index + 1) % ORDER.length]);
+          break;
+        }
+        case 'swipe-left': {
+          const index = ORDER.indexOf(this.currentScene());
+          this.setScene(ORDER[(index - 1 + ORDER.length) % ORDER.length]);
+          break;
+        }
+        case 'palm-pause':
+          this.togglePause();
+          break;
+        case 'fist-reset': {
+          const module = this.#engine.currentModule;
+          module?.resetView?.();
+          this.#hud.toast('info', 'Раскладка сброшена жестом «кулак»');
+          break;
+        }
+        case 'thumbs-up': {
+          const module = this.#engine.currentModule;
+          if (module?.onGesture?.('thumbs-up')) break;
+          this.#hud.toast('info', 'Сцена не использует жест «класс»');
+          break;
+        }
+        case 'hand-lost':
+          this.gesture.setGrabbed(false);
+          this.gesture.setTether(null);
+          break;
+        default:
+          break;
+      }
+    });
+
+    this.gesture.onStatus((status, state) => {
+      if (status.phase === 'running' && this.#lastGestureStatus !== 'running') {
+        this.#hud.toast('info', 'Руки распознаются: щипок — взять узел, ладонь — пауза, свайп — смена сцены');
+      }
+      if (status.phase === 'error' && this.#lastGestureStatus !== 'error') {
+        this.#hud.toast('error', `Жесты недоступны: ${status.message ?? 'ошибка'}`);
+      }
+      this.#lastGestureStatus = status.phase;
+      void state;
+    });
+
+    // Включение: преф из настроек, либо параметры адреса (?hand=1 — камера, ?hand=demo — синтетика).
+    const handParam = params.get('hand');
+    if (handParam === 'demo') this.prefs.set({ handEnabled: true, handDemo: true, handShowSkeleton: true });
+    else if (handParam === '1' || handParam === 'on') this.prefs.set({ handEnabled: true });
   }
 
-  async boot(): Promise<void> {
-    if (this.#booted) return;
-    this.#booted = true;
-
-    try {
-      this.#sys = await invoke<SysInfo>('sys_info');
-    } catch {
-      this.#sys = null;
+  /**
+   * Две руки: разведение — зум, поворот кистей — вращение сцены.
+   * Контроллер отдаёт абсолютный масштаб от начала жеста, сцене нужен шаг за кадр.
+   */
+  #applyTwoHandControl(): void {
+    const two = this.gesture.state.twoHand;
+    if (!two.active) {
+      this.#lastTwoHandScale = 1;
+      return;
     }
+    const step = two.scale / (this.#lastTwoHandScale || 1);
+    this.#lastTwoHandScale = two.scale;
+    if (Math.abs(step - 1) > 0.0005 || Math.abs(two.twist) > 0.0004) {
+      this.#engine.currentModule?.controlOrbit?.(step, two.twist);
+    }
+  }
 
-    // Стартовая сцена: из настроек, для окна вывода — тоже.
-    this.#engine.setScene(this.prefs.get().scene);
-    this.#engine.start();
-    this.#hud.refresh();
+  #syncGesturePause(paused: boolean): void {
+    // На паузе визуализации распознавание продолжается: жестами можно и паузу снять,
+    // и переключить сцену. Камера гасится только при свёрнутом окне.
+    void paused;
+    this.gesture.setPaused(document.hidden);
+  }
 
-    // HUD обновляем 4 раза в секунду: чаще — только зря греет CPU.
-    window.setInterval(() => {
-      this.#hud.updateStats();
-      this.#hud.updateSpark(performance.now());
-    }, 250);
-
-    document.getElementById('boot')?.classList.add('hidden');
+  #syncGestureStatus(): void {
+    if (this.outputMode) return;
+    const status = this.gesture.status;
+    const state = this.gesture.state;
+    const text = this.gesture.enabled
+      ? `${statusLabel(status)}${state.handsCount > 0 ? ` · рук: ${state.handsCount}` : ''}${
+          state.pose !== 'none' ? ` · ${poseLabel(state.pose)}` : ''
+        }${state.grabbed ? ' · захват' : ''}`
+      : 'жесты выключены (G)';
+    this.#hud.setHandStatus(text, status.phase === 'error' ? 'error' : status.phase === 'running' ? 'ok' : '');
   }
 
   /* ─────────────────────────── AppHost ─────────────────────────── */
@@ -145,6 +234,16 @@ class App implements AppHost {
     const visible = !this.prefs.get().hudVisible;
     this.prefs.set({ hudVisible: visible });
     this.#hud.setHudVisible(visible);
+  }
+
+  /** Включить/выключить управление жестами (кнопка HUD или клавиша G). */
+  toggleHands(): void {
+    const enabled = !this.prefs.get().handEnabled;
+    this.prefs.set({ handEnabled: enabled });
+    this.#hud.toast(
+      enabled ? 'info' : 'info',
+      enabled ? 'Включаю распознавание рук — разрешите доступ к камере' : 'Управление жестами выключено',
+    );
   }
 
   toggleFullscreen(): void {
@@ -194,13 +293,72 @@ class App implements AppHost {
       modeLabel: scene?.modeLabel() ?? '—',
       paused: prefs.paused,
       hudVisible: prefs.hudVisible,
+      hands: prefs.handEnabled,
     };
   }
 
   dispose(): void {
     for (const off of this.#unlisteners) off();
+    this.gesture.dispose();
+    this.pointer.dispose();
     this.#engine.dispose();
     this.#audio.dispose();
+  }
+
+  /** Пересобрать панель активной сцены и синхронизировать окно вывода. */
+  #handleSceneChange(id: SceneId): void {
+    this.#hud.setScenePanel(this.#scenes.get(id)?.hudPanel?.() ?? null);
+    this.#hud.refresh();
+    if (this.outputMode || !isTauri) return;
+    // Событие уходит во все окна приложения, включая окно вывода.
+    void import('@tauri-apps/api/event').then(({ emit }) => emit(EV_SCENE_CHANGE, { scene: id }));
+  }
+
+  async boot(): Promise<void> {
+    if (this.#booted) return;
+    this.#booted = true;
+
+    try {
+      this.#sys = await invoke<SysInfo>('sys_info');
+    } catch {
+      this.#sys = null;
+    }
+
+    // Стартовая сцена: из настроек, для окна вывода — тоже.
+    this.#engine.setScene(this.prefs.get().scene);
+    this.#engine.start();
+    this.#hud.refresh();
+
+    // Жесты: включаем, если так просили настройки или параметры адреса.
+    if (!this.outputMode && this.prefs.get().handEnabled) {
+      void this.gesture.setEnabled(true);
+    }
+    document.addEventListener('visibilitychange', () => this.gesture.setPaused(document.hidden));
+
+    // HUD обновляем 4 раза в секунду: чаще — только зря греет CPU.
+    window.setInterval(() => {
+      this.#hud.updateStats();
+      this.#hud.updateSpark(performance.now());
+    }, 250);
+
+    document.getElementById('boot')?.classList.add('hidden');
+  }
+}
+
+function poseLabel(pose: string): string {
+  switch (pose) {
+    case 'pinch':
+      return 'щипок';
+    case 'open':
+      return 'ладонь';
+    case 'fist':
+      return 'кулак';
+    case 'thumbsUp':
+      return 'класс';
+    case 'point':
+      return 'указание';
+    default:
+      return '—';
   }
 }
 
@@ -223,7 +381,7 @@ async function main(): Promise<void> {
     }
   }
 
-  const app = new App(canvas, outputMode);
+  const app = new App(canvas, outputMode, params);
   (window as unknown as { vortex: App }).vortex = app;
 
   // Даём браузеру показать первый кадр, затем убираем экран загрузки.

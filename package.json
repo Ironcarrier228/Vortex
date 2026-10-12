@@ -6,16 +6,21 @@
   "description": "Vortex — 3D-центр визуализации данных (Tauri + three.js)",
   "scripts": {
     "dev": "vite",
+    "predev": "node tools/sync-mediapipe.mjs",
     "build": "tsc --noEmit && vite build",
+    "prebuild": "node tools/sync-mediapipe.mjs",
     "preview": "vite preview",
     "typecheck": "tsc --noEmit",
+    "smoke": "esbuild tools/smoke.test.ts --bundle --format=esm --platform=node --outfile=node_modules/.vortex-smoke.mjs --log-level=warning && node node_modules/.vortex-smoke.mjs",
+    "check": "npm run typecheck && npm run smoke",
+    "sync:mediapipe": "node tools/sync-mediapipe.mjs",
+    "fetch:models": "node tools/fetch_models.mjs",
     "tauri": "tauri",
     "app:dev": "tauri dev",
-    "app:build": "tauri build",
-    "smoke": "esbuild tools/smoke.test.ts --bundle --format=esm --platform=node --outfile=node_modules/.vortex-smoke.mjs --log-level=warning && node node_modules/.vortex-smoke.mjs",
-    "check": "npm run typecheck && npm run smoke"
+    "app:build": "tauri build"
   },
   "dependencies": {
+    "@mediapipe/tasks-vision": "^1.1.0",
     "@tauri-apps/api": "2.12.3",
     "d3-force-3d": "3.0.6",
     "three": "^0.186.0"

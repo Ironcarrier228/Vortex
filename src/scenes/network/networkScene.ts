@@ -26,6 +26,11 @@ interface GlobePoint {
   node?: GraphNode;
 }
 
+/** Перемещение курсора (в NDC), после которого нажатие считается перетаскиванием. */
+const DRAG_TRIGGER_NDC = 0.012;
+/** Максимальное удаление узла от центра сцены при перетаскивании (мировые единицы). */
+const NODE_DRAG_LIMIT = 190;
+
 export class NetworkScene implements SceneModule {
   readonly id = 'network' as const;
   readonly title = 'Карта сети';
@@ -64,6 +69,19 @@ export class NetworkScene implements SceneModule {
   #activated = false;
   #statusText = 'ожидание данных…';
   #unsubscribePrefs: (() => void) | null = null;
+
+  // ── Указатель: мышь и рука через общий PointerHub ──
+  #pointerOffs: (() => void)[] = [];
+  /** Подтверждённое начало перетаскивания (узел уже взят). */
+  #dragging = false;
+  /** Кандидат на перетаскивание: узел под указателем в момент нажатия/щипка. */
+  #dragCandidate: GraphNode | null = null;
+  #dragStartNdc = new THREE.Vector2();
+  #raycaster = new THREE.Raycaster();
+  #dragPlane = new THREE.Plane();
+  #dragPoint = new THREE.Vector3();
+  #dragOffset = new THREE.Vector3();
+  #projected = new THREE.Vector3();
 
   constructor(ctx: SceneContext) {
     this.#ctx = ctx;
@@ -238,9 +256,13 @@ export class NetworkScene implements SceneModule {
     if (!this.#activated) {
       const canvas = document.getElementById('viewport');
       if (canvas) this.#detachPointer = this.#orbit.attach(canvas);
-      canvas?.addEventListener('pointermove', this.#onPointerMove);
-      canvas?.addEventListener('pointerleave', this.#onPointerLeave);
-      canvas?.addEventListener('pointerdown', this.#onPointerDown);
+      // Сцены больше не слушают мышь напрямую: есть один указатель (мышь или рука).
+      this.#pointerOffs.push(
+        this.#ctx.pointer.onMove(() => this.#syncPointer()),
+        this.#ctx.pointer.onPress(() => this.#onPointerPress()),
+        this.#ctx.pointer.onRelease(() => this.#onPointerRelease()),
+        this.#ctx.pointer.onClick(() => this.#onPointerClick()),
+      );
       window.addEventListener('keydown', this.#onKeyDown);
       this.#unsubscribePrefs = this.#ctx.prefs.subscribe((prefs, changed) => {
         if (changed.includes('networkGlobe')) this.#setGlobe(prefs.networkGlobe);
@@ -262,6 +284,7 @@ export class NetworkScene implements SceneModule {
   }
 
   deactivate(): void {
+    this.#releaseDrag();
     this.#unlisten?.();
     this.#unlisten = null;
     for (const off of this.#unlisteners) off();
@@ -276,6 +299,31 @@ export class NetworkScene implements SceneModule {
 
   onKey(code: string): boolean {
     if (code !== 'KeyM') return false;
+    this.#ctx.prefs.set({ networkGlobe: !this.#ctx.prefs.get().networkGlobe });
+    return true;
+  }
+
+  /* ─────────────────────────── Жесты ─────────────────────────── */
+
+  /**
+   * Жест «кулак»: вернуть камеру и снять закрепления узлов.
+   * Узлы, которые пользователь расставил руками, возвращаются в физику.
+   */
+  resetView(): void {
+    this.#releaseDrag();
+    this.#graph.unpinAll();
+    this.#orbit.reset();
+  }
+
+  /** Две руки: разведение — зум, поворот кистей — вращение вокруг центра. */
+  controlOrbit(zoom: number, twist: number): void {
+    this.#orbit.zoomBy(zoom);
+    this.#orbit.rotateBy(twist, 0);
+  }
+
+  /** Жест «класс»: переключить «граф» ↔ «глобус». */
+  onGesture(name: string): boolean {
+    if (name !== 'thumbs-up') return false;
     this.#ctx.prefs.set({ networkGlobe: !this.#ctx.prefs.get().networkGlobe });
     return true;
   }
@@ -397,6 +445,10 @@ export class NetworkScene implements SceneModule {
   /* ─────────────────────────── Кадр ─────────────────────────── */
 
   update(dt: number, time: number, state: SceneState): void {
+    // Курсор: мышь обновляет его событиями, рука — каждый кадр слоем жестов.
+    this.#syncPointer();
+    this.#updateDrag();
+
     if (this.#globeActive) {
       this.#updateGlobe(dt, time);
     } else {
@@ -406,7 +458,8 @@ export class NetworkScene implements SceneModule {
     this.#updateLabels();
 
     // Наведение: пересчитываем под курсором (дёшево — прямая проекция узлов).
-    if (!this.#globeActive && this.#pointer.inside) {
+    if (!this.#pointer.inside) this.#ctx.hud.hideTooltip();
+    if (!this.#globeActive && this.#pointer.inside && !this.#dragging) {
       const node = this.#graph.hitTest(this.camera, this.#ndc.x, this.#ndc.y);
       this.#hovered = node;
       if (node) {
@@ -416,6 +469,108 @@ export class NetworkScene implements SceneModule {
       }
     }
     void state;
+  }
+
+  /** Прочитать состояние общего указателя (мышь или рука) в локальные поля. */
+  #syncPointer(): void {
+    const pointer = this.#ctx.pointer.state;
+    this.#pointer.x = pointer.screenX;
+    this.#pointer.y = pointer.screenY;
+    this.#pointer.inside = pointer.active && !this.#globeActive;
+    this.#ndc.set(pointer.ndcX, pointer.ndcY);
+  }
+
+  /* ─────────────────────────── Перетаскивание узлов ─────────────────────────── */
+
+  /**
+   * Нажатие (мышь) или щипок (рука). Запоминаем узел-кандидат: перетаскивание начнётся,
+   * когда указатель сдвинется, — так обычный клик по узлу остаётся выбором, а не «толчком».
+   */
+  #onPointerPress(): void {
+    if (this.#globeActive) return;
+    this.#syncPointer();
+    const node = this.#graph.hitTest(this.camera, this.#ndc.x, this.#ndc.y);
+    this.#hovered = node;
+    this.#dragCandidate = node;
+    this.#dragStartNdc.copy(this.#ndc);
+  }
+
+  /** Начало фактического перетаскивания: узел закрепляется и следует за указателем. */
+  #beginDrag(node: GraphNode): void {
+    this.#dragging = true;
+    this.#dragCandidate = null;
+    this.#graph.beginDrag(node);
+    // Камера не должна крутиться, пока тянем узел мышью.
+    this.#orbit.setSuspended(true);
+    this.#ctx.gesture.setGrabbed(true);
+
+    const normal = new THREE.Vector3();
+    this.camera.getWorldDirection(normal);
+    normal.negate();
+    const anchor = new THREE.Vector3(node.x ?? 0, node.y ?? 0, node.z ?? 0);
+    this.#dragPlane.setFromNormalAndCoplanarPoint(normal, anchor);
+
+    const hit = this.#pointerOnDragPlane();
+    if (hit) this.#dragOffset.copy(anchor).sub(hit);
+    else this.#dragOffset.set(0, 0, 0);
+  }
+
+  /** Обновление узла под указателем: луч камеры × плоскость, «замороженная» при захвате. */
+  #updateDrag(): void {
+    if (this.#dragging) {
+      const hit = this.#pointerOnDragPlane();
+      if (hit) {
+        const point = this.#dragPoint.copy(hit).add(this.#dragOffset);
+        // Ограничиваем перемещение сферой вокруг центра: узел не улетает в пустоту.
+        if (point.length() > NODE_DRAG_LIMIT) point.setLength(NODE_DRAG_LIMIT);
+        this.#graph.moveDragged(point);
+        this.#projected.set(point.x, point.y, point.z).project(this.camera);
+        this.#ctx.gesture.setTether({
+          x: (this.#projected.x * 0.5 + 0.5) * window.innerWidth,
+          y: (-this.#projected.y * 0.5 + 0.5) * window.innerHeight,
+        });
+      }
+      return;
+    }
+
+    // Ждём подтверждения: указатель сдвинулся достаточно далеко от точки нажатия.
+    const candidate = this.#dragCandidate;
+    if (!candidate || !this.#ctx.pointer.state.pressed) return;
+    if (this.#ndc.distanceTo(this.#dragStartNdc) > DRAG_TRIGGER_NDC) this.#beginDrag(candidate);
+  }
+
+  #onPointerRelease(): void {
+    this.#releaseDrag();
+    this.#dragCandidate = null;
+  }
+
+  /** Отпустить узел: он остаётся закреплённым там, где его оставили (снимается «кулаком»). */
+  #releaseDrag(): void {
+    if (!this.#dragging) return;
+    this.#dragging = false;
+    this.#orbit.setSuspended(false);
+    const node = this.#graph.dragged;
+    this.#graph.endDrag(true);
+    this.#ctx.gesture.setGrabbed(false);
+    this.#ctx.gesture.setTether(null);
+    if (node) this.#ctx.toast('info', `Узел «${node.label}» закреплён · кулак снимает закрепление`);
+  }
+
+  /** Короткое нажатие = выбор узла (мышью или щипком). */
+  #onPointerClick(): void {
+    if (this.#dragging) return;
+    if (this.#globeActive || !this.#hovered) {
+      this.#selected = null;
+      this.#renderPanel();
+      return;
+    }
+    this.#selected = this.#selected?.id === this.#hovered.id ? null : this.#hovered;
+    this.#renderPanel();
+  }
+
+  #pointerOnDragPlane(): THREE.Vector3 | null {
+    this.#raycaster.setFromCamera(this.#ndc, this.camera);
+    return this.#raycaster.ray.intersectPlane(this.#dragPlane, this.#dragPoint);
   }
 
   #updateGlobe(dt: number, time: number): void {
@@ -462,10 +617,8 @@ export class NetworkScene implements SceneModule {
   dispose(): void {
     this.deactivate();
     this.#detachPointer?.();
-    const canvas = document.getElementById('viewport');
-    canvas?.removeEventListener('pointermove', this.#onPointerMove);
-    canvas?.removeEventListener('pointerleave', this.#onPointerLeave);
-    canvas?.removeEventListener('pointerdown', this.#onPointerDown);
+    for (const off of this.#pointerOffs) off();
+    this.#pointerOffs = [];
     window.removeEventListener('keydown', this.#onKeyDown);
     this.#unsubscribePrefs?.();
     this.#labels.remove();
@@ -481,32 +634,6 @@ export class NetworkScene implements SceneModule {
   }
 
   /* ─────────────────────────── Взаимодействие ─────────────────────────── */
-
-  #onPointerMove = (event: PointerEvent): void => {
-    const rect = (event.target as HTMLElement).getBoundingClientRect();
-    this.#pointer.x = event.clientX;
-    this.#pointer.y = event.clientY;
-    this.#pointer.inside = true;
-    this.#ndc.set(
-      ((event.clientX - rect.left) / rect.width) * 2 - 1,
-      -(((event.clientY - rect.top) / rect.height) * 2 - 1),
-    );
-  };
-
-  #onPointerLeave = (): void => {
-    this.#pointer.inside = false;
-    this.#ctx.hud.hideTooltip();
-  };
-
-  #onPointerDown = (): void => {
-    if (this.#globeActive || !this.#hovered) {
-      this.#selected = null;
-      this.#renderPanel();
-      return;
-    }
-    this.#selected = this.#selected?.id === this.#hovered.id ? null : this.#hovered;
-    this.#renderPanel();
-  };
 
   #showTooltip(node: GraphNode): void {
     const rows =

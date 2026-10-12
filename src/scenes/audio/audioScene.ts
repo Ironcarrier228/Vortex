@@ -267,6 +267,30 @@ export class AudioScene implements SceneModule {
     return true;
   }
 
+  /* ─────────────────────────── Жесты ─────────────────────────── */
+
+  /** Жест «кулак»: вернуть камеру и вид в исходное состояние. */
+  resetView(): void {
+    this.#applyMode(this.#mode, true);
+    this.#orbit.reset();
+  }
+
+  /** Две руки: разведение — зум, поворот кистей — вращение камеры. */
+  controlOrbit(zoom: number, twist: number): void {
+    this.#orbit.zoomBy(zoom);
+    this.#orbit.rotateBy(twist, 0);
+  }
+
+  /** Жест «класс» в аудиовизуализаторе: следующий режим — эффектный переход между шейдерами. */
+  onGesture(name: string): boolean {
+    if (name !== 'thumbs-up') return false;
+    const index = MODES.findIndex((mode) => mode.id === this.#mode);
+    const next = MODES[(index + 1) % MODES.length];
+    this.#ctx.prefs.set({ audioMode: next.id });
+    this.#ctx.toast('info', `Режим: ${next.label}`);
+    return true;
+  }
+
   hudPanel(): HTMLElement {
     const panel = document.createElement('div');
     panel.className = 'hud-panel';

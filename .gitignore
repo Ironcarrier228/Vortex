@@ -12,6 +12,12 @@ src-tauri/gen/
 **/*.rs.bk
 Cargo.lock.orig
 
+# WASM MediaPipe копируется из node_modules (npm run sync:mediapipe)
+public/mediapipe/
+
+# модель руки MediaPipe: npm run fetch:models (Apache-2.0, но бинарник в git не нужен)
+public/models/*.task
+
 # локальные данные GeoIP (лицензия запрещает коммитить базу)
 assets/geoip/*.mmdb
 assets/geoip/*.mmdb.gz

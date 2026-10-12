@@ -303,4 +303,13 @@ export const HUD_CSS = /* css */ `
 /* Слайдер-строки в настройках */
 .hud-settings .hud-field + .hud-field { margin-top: 10px; }
 .hud-settings label.hud-field-head { cursor: pointer; }
+
+/* Состояние распознавания рук в нижней строке HUD. */
+.hud-hands-ok {
+  color: var(--cyan, #22d3ee);
+}
+
+.hud-hands-error {
+  color: #f87171;
+}
 `;

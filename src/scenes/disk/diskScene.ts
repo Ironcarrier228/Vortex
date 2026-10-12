@@ -157,10 +157,35 @@ export class DiskScene implements SceneModule {
 
   onKey(code: string): boolean {
     if (code !== 'KeyM') return false;
+    this.#toggleMode();
+    return true;
+  }
+
+  /* ─────────────────────────── Жесты ─────────────────────────── */
+
+  /** Жест «кулак»: вернуть камеру и раскладку. */
+  resetView(): void {
+    this.#orbit.reset();
+    this.#rebuild();
+  }
+
+  /** Две руки: разведение — зум, поворот кистей — вращение сцены. */
+  controlOrbit(zoom: number, twist: number): void {
+    this.#orbit.zoomBy(zoom);
+    this.#orbit.rotateBy(twist, 0);
+  }
+
+  /** Жест «класс»: переключение «город» ↔ «sunburst». */
+  onGesture(name: string): boolean {
+    if (name !== 'thumbs-up') return false;
+    this.#toggleMode();
+    return true;
+  }
+
+  #toggleMode(): void {
     this.#mode = this.#mode === 'city' ? 'sunburst' : 'city';
     this.#rebuild();
     this.#renderPanel();
-    return true;
   }
 
   /* ─────────────────────────── Сканирование ─────────────────────────── */

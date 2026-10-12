@@ -7,7 +7,10 @@
 
 import type * as THREE from 'three';
 import type { AudioBus } from './audio/bus';
+import type { GestureName } from './gesture/types';
+import type { GestureService } from './gesture';
 import type { Hud } from './hud/hud';
+import type { PointerHub } from './interaction/pointer';
 import type { PrefsStore, SceneId } from './prefs';
 
 export type { SceneId };
@@ -31,6 +34,10 @@ export interface SceneContext {
   audio: AudioBus;
   prefs: PrefsStore;
   hud: Hud;
+  /** Единый указатель: мышь или рука (щипок = нажатие). */
+  pointer: PointerHub;
+  /** Состояние жестов читается сценами каждый кадр (курсор, щипок, две руки). */
+  gesture: GestureService;
   /**
    * 'main' — обычное окно (можно запускать сканы и опросы),
    * 'output' — безрамочное окно вывода на второй монитор: только рендер, без побочных эффектов.
@@ -62,6 +69,16 @@ export interface SceneModule {
   resize(width: number, height: number, pixelRatio: number): void;
   /** Обработка клавиши (M — смена режима и т.п.). Вернуть true, если клавиша обработана. */
   onKey?(code: string): boolean;
+  /** Жест «кулак»: вернуть камеру и раскладку в исходное состояние. */
+  resetView?(): void;
+  /**
+   * Жест двумя руками: `zoom` — множитель дистанции камеры (руки развели → zoom > 1),
+   * `twist` — приращение угла поворота сцены за кадр (радианы). Вызывается каждый кадр,
+   * пока жест активен.
+   */
+  controlOrbit?(zoom: number, twist: number): void;
+  /** Командный жест в контексте сцены (например, «класс» = запустить скан). Вернуть true, если обработано. */
+  onGesture?(name: GestureName): boolean;
   /** Панель сцены в HUD (создаётся ядром, владеет сценой). */
   hudPanel?(): HTMLElement;
   dispose(): void;

@@ -53,6 +53,10 @@ export interface GraphNode {
   vx?: number;
   vy?: number;
   vz?: number;
+  /** Закрепление узла (d3-force): пока задано, узел не двигается физикой. */
+  fx?: number | null;
+  fy?: number | null;
+  fz?: number | null;
   index?: number;
 }
 
@@ -96,6 +100,7 @@ export class ForceGraph {
   #pulsePositions: Float32Array;
   #selection = new THREE.Color();
   #tempColor = new THREE.Color();
+  #dragged: GraphNode | null = null;
 
   constructor() {
     this.#localNode = {
@@ -245,6 +250,7 @@ export class ForceGraph {
     for (let i = this.nodes.length - 1; i >= 0; i--) {
       const node = this.nodes[i];
       if (node.kind === 'local' || seen.has(node.id)) continue;
+      if (this.#dragged === node) this.#dragged = null;
       this.nodes.splice(i, 1);
       this.#byId.delete(node.id);
     }
@@ -329,7 +335,8 @@ export class ForceGraph {
   /** Шаг физики + обновление геометрии. Вызывается каждый кадр. */
   update(dt: number, time: number, selectedId: string | null): void {
     // Физику гоняем только пока система «горячая» — иначе CPU простаивает.
-    if (this.#simulation.alpha() > 0.005) this.#simulation.tick();
+    // Во время перетаскивания узел тянет пользователь, физика должна отзываться сразу.
+    if (this.#simulation.alpha() > 0.005 || this.#dragged) this.#simulation.tick();
 
     for (const node of this.nodes) {
       // Плавное затухание интенсивности и подъём «пульсации» процесса.
@@ -454,6 +461,68 @@ export class ForceGraph {
 
   getNode(id: string): GraphNode | undefined {
     return this.#byId.get(id);
+  }
+
+  /* ─────────────── Перетаскивание узлов (мышь/жест «щипок») ─────────────── */
+
+  get dragged(): GraphNode | null {
+    return this.#dragged;
+  }
+
+  /**
+   * Взять узел: он закрепляется в текущей точке и дальше следует за указателем
+   * (`moveDragged`), а физика перестаёт его тянуть. Возвращает сам узел.
+   */
+  beginDrag(node: GraphNode): GraphNode {
+    this.#dragged = node;
+    node.fx = node.x ?? 0;
+    node.fy = node.y ?? 0;
+    node.fz = node.z ?? 0;
+    this.#simulation.alpha(Math.max(this.#simulation.alpha(), 0.4));
+    return node;
+  }
+
+  /** Двигать взятый узел в мировую точку (луч курсора × плоскость узла). */
+  moveDragged(point: THREE.Vector3): void {
+    const node = this.#dragged;
+    if (!node) return;
+    node.fx = point.x;
+    node.fy = point.y;
+    node.fz = point.z;
+    node.x = point.x;
+    node.y = point.y;
+    node.z = point.z;
+    node.vx = 0;
+    node.vy = 0;
+    node.vz = 0;
+    node.target = 1;
+    this.#simulation.alpha(Math.max(this.#simulation.alpha(), 0.24));
+  }
+
+  /**
+   * Отпустить узел. `pin = true` — узел остаётся закреплённым там, где его оставили
+   * (удобно «расставлять» узлы руками), иначе возвращается в физику.
+   */
+  endDrag(pin: boolean): void {
+    const node = this.#dragged;
+    this.#dragged = null;
+    if (!node) return;
+    if (!pin) {
+      node.fx = null;
+      node.fy = null;
+      node.fz = null;
+    }
+    this.#simulation.alpha(Math.max(this.#simulation.alpha(), 0.45));
+  }
+
+  /** Снять все закрепления (жест «кулак» / кнопка сброса). */
+  unpinAll(): void {
+    for (const node of this.nodes) {
+      node.fx = null;
+      node.fy = null;
+      node.fz = null;
+    }
+    this.#simulation.alpha(Math.max(this.#simulation.alpha(), 0.6));
   }
 
   dispose(): void {
