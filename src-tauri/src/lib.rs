@@ -12,7 +12,7 @@
 
 mod commands;
 mod error;
-mod events;
+pub mod events; // публичный модуль: пейлоады — контракт между Rust и TypeScript
 mod providers;
 mod state;
 
@@ -42,30 +42,31 @@ pub fn run() {
             commands::window::close_output_window,
             commands::window::toggle_main_fullscreen,
         ])
+        // ВНИМАНИЕ: `on_window_event` есть только у `Builder` и у `Window`,
+        // но не у `App` — поэтому глобальный обработчик вешается здесь, а не в `setup`.
+        .on_window_event(|window, event| {
+            if window.label() != commands::window::OUTPUT_LABEL {
+                return;
+            }
+            // Окно вывода закрыли (Esc/alt+F4/кнопка) — сообщаем главному окну,
+            // чтобы HUD снял отметку «второй экран активен».
+            if matches!(event, tauri::WindowEvent::Destroyed) {
+                let app = window.app_handle().clone();
+                events::emit(
+                    &app,
+                    events::EV_OUTPUT_WINDOW,
+                    events::OutputWindowPayload {
+                        open: false,
+                        monitor: None,
+                        label: commands::window::OUTPUT_LABEL.to_string(),
+                    },
+                );
+            }
+        })
         .setup(|app| {
             // Информация о системе нужна HUD сразу, до первого invoke.
             let info = app.state::<state::AppState>().sys.clone();
             events::emit(app.handle(), events::EV_SYS_INFO, info);
-
-            // Следим за закрытием окна вывода: HUD должен узнать, что оно исчезло.
-            let handle = app.handle().clone();
-            app.on_window_event(move |window, event| {
-                if window.label() != commands::window::OUTPUT_LABEL {
-                    return;
-                }
-                if let tauri::WindowEvent::Destroyed = event {
-                    events::emit(
-                        &handle,
-                        events::EV_OUTPUT_WINDOW,
-                        commands::window::OutputWindowPayload {
-                            open: false,
-                            monitor: None,
-                            label: commands::window::OUTPUT_LABEL.to_string(),
-                        },
-                    );
-                }
-            });
-
             Ok(())
         })
         .run(tauri::generate_context!())

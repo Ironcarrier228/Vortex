@@ -163,6 +163,15 @@ pub struct SysInfoPayload {
     pub features: FeatureFlags,
 }
 
+/// Состояние окна вывода на второй монитор.
+#[derive(Clone, Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OutputWindowPayload {
+    pub open: bool,
+    pub monitor: Option<usize>,
+    pub label: String,
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ToastPayload {

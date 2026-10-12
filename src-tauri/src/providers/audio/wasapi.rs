@@ -104,11 +104,13 @@ pub fn run(
     let emit_every = ((rate as f64 * cfg.emit_every_ms as f64 / 1000.0).round() as usize).max(1);
 
     let mut analyser = Analyser::new(cfg.fft_size, cfg.bands);
-    let mut mixer = MonoMixer::new(channels, kind);
+    let mixer = MonoMixer::new(channels, kind);
     let mut raw: Vec<u8> = Vec::with_capacity(block_align * 4096);
     let mut mono: Vec<f32> = Vec::with_capacity(16_384);
 
-    let result = loop {
+    // Метка нужна, чтобы ошибка чтения выходила из ОБОИХ циклов: у внутреннего
+    // цикла, который просто «осушает» буфер, значение break имеет тип `()`.
+    let result = 'capture: loop {
         if stop.load(Ordering::Relaxed) {
             break Ok(());
         }
@@ -140,11 +142,11 @@ pub fn run(
                                 );
                             }
                         }
-                        Err(err) => break Err(format!("read_from_device: {err}")),
+                        Err(err) => break 'capture Err(format!("read_from_device: {err}")),
                     }
                 }
                 Ok(_) => break,
-                Err(err) => break Err(format!("get_next_packet_size: {err}")),
+                Err(err) => break 'capture Err(format!("get_next_packet_size: {err}")),
             }
 
             // Пауза: продолжаем вычитывать буфер (иначе движок встанет), но не анализируем.

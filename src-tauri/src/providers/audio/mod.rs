@@ -64,10 +64,6 @@ impl CaptureHandle {
         self.active.store(on, Ordering::Relaxed);
     }
 
-    pub fn is_active(&self) -> bool {
-        self.active.load(Ordering::Relaxed)
-    }
-
     pub fn stop(&self) {
         self.stop.store(true, Ordering::Relaxed);
     }

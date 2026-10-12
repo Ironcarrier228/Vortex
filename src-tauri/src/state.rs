@@ -3,7 +3,6 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
 
 use vortex_core::disk::DiskNode;
 use vortex_core::netdiff::ConnDiffState;
@@ -16,7 +15,6 @@ use crate::providers::network::ProcCache;
 pub struct AudioState {
     pub info: Mutex<AudioInfoPayload>,
     pub handle: Mutex<Option<CaptureHandle>>,
-    pub started_at: Mutex<Option<Instant>>,
 }
 
 pub struct NetState {

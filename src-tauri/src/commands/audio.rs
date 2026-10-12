@@ -6,8 +6,6 @@
 //! * `audio_stop` — полностью освободить устройство;
 //! * `audio_status` — текущее состояние (устройство, частота, причина отказа).
 
-use std::time::Instant;
-
 use tauri::{AppHandle, Manager, State};
 
 use crate::error::Result;
@@ -76,7 +74,6 @@ pub fn audio_start(app: AppHandle, state: State<'_, AppState>) -> Result<AudioIn
         let mut guard = state.audio.handle.lock().unwrap();
         *guard = Some(handle);
     }
-    *state.audio.started_at.lock().unwrap() = Some(Instant::now());
     Ok(state.audio.info.lock().unwrap().clone())
 }
 

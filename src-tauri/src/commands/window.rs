@@ -5,21 +5,12 @@
 //! выбранном мониторе. Фронтенд в этом окне по метке `output` рисует только визуализацию
 //! без HUD.
 
-use serde::Serialize;
 use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindowBuilder};
 
 use crate::error::Result;
-use crate::events::EV_OUTPUT_WINDOW;
+use crate::events::{OutputWindowPayload, EV_OUTPUT_WINDOW};
 
 pub const OUTPUT_LABEL: &str = "output";
-
-#[derive(Clone, Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct OutputWindowPayload {
-    pub open: bool,
-    pub monitor: Option<usize>,
-    pub label: String,
-}
 
 #[tauri::command]
 pub fn open_output_window(app: AppHandle, monitor: Option<usize>) -> Result<OutputWindowPayload> {

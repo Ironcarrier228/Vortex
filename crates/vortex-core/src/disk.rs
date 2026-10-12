@@ -49,7 +49,8 @@ pub fn categorize(ext: &str) -> &'static str {
 /// Расширение из имени файла (нижний регистр, без точки). `.env` → "env".
 pub fn extension_of(name: &str) -> String {
     match name.rsplit_once('.') {
-        Some((stem, ext)) if !ext.is_empty() => ext.to_ascii_lowercase(),
+        // Стебель не нужен: важно только расширение после последней точки.
+        Some((_, ext)) if !ext.is_empty() => ext.to_ascii_lowercase(),
         _ => String::new(),
     }
 }

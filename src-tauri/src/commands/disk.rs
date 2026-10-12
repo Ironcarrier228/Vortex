@@ -114,6 +114,9 @@ pub fn disk_scan(
 
             let outcome = crate::providers::disk::scan(&options, &cancel, &emit_stats);
 
+            // Финальная статистика: последнее событие могло быть отправлено в момент,
+            // когда фронтенд ещё не подписался, поэтому кладём её и в состояние.
+            *state.disk.stats.lock().unwrap() = outcome.stats.clone();
             *state.disk.tree.lock().unwrap() = Some(Arc::new(outcome.tree));
             {
                 let mut roots = state.disk.roots.lock().unwrap();

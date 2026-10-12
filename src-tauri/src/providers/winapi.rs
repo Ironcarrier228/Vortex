@@ -28,6 +28,9 @@ struct MemoryStatusEx {
     avail_extended_virtual: u64,
 }
 
+// Явная линковка: kernel32.lib не гарантирован в стандартном наборе линковщика,
+// а без `#[link]` символы могут не разрешиться на этапе сборки.
+#[link(name = "kernel32")]
 unsafe extern "system" {
     fn GetCurrentProcess() -> *mut core::ffi::c_void;
     fn OpenProcess(
