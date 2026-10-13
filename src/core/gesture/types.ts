@@ -34,6 +34,11 @@ export interface HandSource {
   readonly status: SourceStatus;
   start(): Promise<void>;
   stop(): void;
+  /**
+   * Ограничить частоту распознавания (кадров в секунду). Нужно на слабых машинах:
+   * модель и рендер делят один GPU, и 30 Гц распознавания роняют картинку ниже 30 FPS.
+   */
+  setMaxHz?(hz: number): void;
   onFrame(listener: (frame: HandFrame) => void): () => void;
   onStatus(listener: (status: SourceStatus) => void): () => void;
 }
@@ -49,6 +54,8 @@ export type SourcePhase =
 export interface SourceStatus {
   /** Откуда взялась модель (для диагностики в HUD). */
   modelSource?: string;
+  /** Активен ли экономный режим распознавания (строка вида «12 Гц»). */
+  economy?: string;
   phase: SourcePhase;
   message?: string;
   /// Реальный FPS распознавания.

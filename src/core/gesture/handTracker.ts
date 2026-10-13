@@ -41,6 +41,9 @@ export class CameraHandSource implements HandSource {
   #fpsEma = 0;
   #lastFrameAt = 0;
   #videoCallbackId = 0;
+  /** Минимальный интервал между распознаваниями (мс) — адаптивная экономия GPU. */
+  #minIntervalMs = 0;
+  #lastDetectAt = 0;
 
   /** Видео нужно оверлею для превью камеры. */
   get videoElement(): HTMLVideoElement | null {
@@ -90,6 +93,10 @@ export class CameraHandSource implements HandSource {
     this.#setStatus({ phase: 'off' });
   }
 
+  setMaxHz(hz: number): void {
+    this.#minIntervalMs = hz > 0 ? 1000 / hz : 0;
+  }
+
   onFrame(listener: (frame: HandFrame) => void): () => void {
     this.#frameListeners.add(listener);
     return () => this.#frameListeners.delete(listener);
@@ -107,6 +114,7 @@ export class CameraHandSource implements HandSource {
   }
 
   #teardownHardware(): void {
+    this.#lastDetectAt = 0;
     if (this.#videoCallbackId && this.#video) {
       const video = this.#video as HTMLVideoElement & {
         cancelVideoFrameCallback?: (id: number) => void;
@@ -267,6 +275,9 @@ export class CameraHandSource implements HandSource {
     if (!landmarker || !video || !this.#running || video.readyState < 2) return;
 
     const timestamp = performance.now();
+    // Экономный режим: на слабом GPU пропускаем часть кадров видео, чтобы не душить рендер.
+    if (this.#minIntervalMs > 0 && timestamp - this.#lastDetectAt < this.#minIntervalMs) return;
+    this.#lastDetectAt = timestamp;
     // MediaPipe требует строго возрастающую метку времени.
     if (timestamp <= this.#lastTimestamp) return;
     this.#lastTimestamp = timestamp;

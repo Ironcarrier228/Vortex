@@ -34,6 +34,7 @@ export class DemoHandSource implements HandSource {
   #startedAt = 0;
   #lastFrameAt = 0;
   #fpsEma = 0;
+  #minIntervalMs = 1000 / 30;
 
   async start(): Promise<void> {
     if (this.#running) return;
@@ -49,6 +50,10 @@ export class DemoHandSource implements HandSource {
     if (this.#handle) cancelAnimationFrame(this.#handle);
     this.#handle = 0;
     this.#setStatus({ phase: 'off' });
+  }
+
+  setMaxHz(hz: number): void {
+    this.#minIntervalMs = hz > 0 ? 1000 / hz : 1000 / 30;
   }
 
   onFrame(listener: (frame: HandFrame) => void): () => void {
@@ -73,7 +78,7 @@ export class DemoHandSource implements HandSource {
 
     const now = performance.now();
     const dtMs = now - this.#lastFrameAt;
-    if (dtMs < 1000 / 30) return; // держим «30 FPS распознавания», как у реальной модели
+    if (dtMs < this.#minIntervalMs) return; // держим «30 FPS распознавания», как у реальной модели
     this.#lastFrameAt = now;
 
     const elapsed = (now - this.#startedAt) / 1000;

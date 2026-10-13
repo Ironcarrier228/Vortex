@@ -29,6 +29,7 @@ import { GestureController } from '../src/core/gesture/gestureController';
 import { DemoHandSource } from '../src/core/gesture/demoHand';
 import { loadMediaPipe } from '../src/core/gesture/mediapipe';
 import { PointerHub } from '../src/core/interaction/pointer';
+import { economyRate } from '../src/core/gesture/rate';
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { runInThisContext } from 'node:vm';
@@ -326,6 +327,14 @@ async function main(): Promise<void> {
     MODEL_SOURCES[0] === '/models/hand_landmarker.task' && MODEL_SOURCES.length >= 3,
     `локальный путь — первый источник, зеркал не меньше двух (${MODEL_SOURCES.length})`,
   );
+
+  console.log('Жесты: экономный режим (общая частота с рендером)');
+  // Модель и рендер делят один GPU: при просадке FPS распознавание реже, картинка плавнее.
+  check(economyRate(60) === 30 && economyRate(45) === 30, 'свободный рендер — 30 Гц распознавания');
+  check(economyRate(38) === 20, 'просадка до 38 FPS — 20 Гц');
+  check(economyRate(18) === 12, 'тяжёлая сцена (18 FPS) — экономные 12 Гц');
+  check(economyRate(0) === 30 && economyRate(Number.NaN) === 30, 'неизвестный FPS не ломает расчёт');
+  check([12, 20, 30].every((hz) => hz >= 12 && hz <= 30), 'частота остаётся в разумных пределах');
 
   console.log(failures === 0 ? '\nВсе проверки пройдены ✅' : `\nПровалено проверок: ${failures} ❌`);
   process.exit(failures === 0 ? 0 : 1);

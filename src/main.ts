@@ -76,7 +76,9 @@ class App implements AppHost {
 
     // Слой жестов обновляется ДО сцен: сцены должны видеть актуальный курсор в этом же кадре.
     this.#engine.addFrameHook((dt) => {
-      this.gesture.update(dt);
+      // FPS отрисовки передаём в слой жестов: он сам снижает частоту распознавания,
+      // если картинка просела (модель и рендер делят один GPU).
+      this.gesture.update(dt, this.#engine.stats.fps);
       this.#applyTwoHandControl();
       this.#syncGestureStatus();
     });

@@ -66,6 +66,8 @@ export class NetworkScene implements SceneModule {
   #labelPool: HTMLElement[] = [];
   #panelBody: HTMLElement | null = null;
   #panelStats: HTMLElement | null = null;
+  #panelMode: HTMLElement | null = null;
+  #modeButtons: HTMLButtonElement[] = [];
   #activated = false;
   #statusText = 'ожидание данных…';
   #unsubscribePrefs: (() => void) | null = null;
@@ -103,7 +105,8 @@ export class NetworkScene implements SceneModule {
 
     // ── Глобус: процедурная «земля» (континенты из шума, сетка координат).
     this.#earth = new THREE.Mesh(
-      new THREE.SphereGeometry(GLOBE_RADIUS, 96, 64),
+      // 64×48 вместо 96×64: визуально то же, но на слабом GPU вдвое дешевле.
+      new THREE.SphereGeometry(GLOBE_RADIUS, 64, 48),
       new THREE.ShaderMaterial({
         uniforms: { uTime: { value: 0 }, uActive: { value: 0 } },
         vertexShader: /* glsl */ `
@@ -142,9 +145,11 @@ export class NetworkScene implements SceneModule {
               f.z);
           }
           float fbm(vec3 p) {
+            // Четыре октавы вместо пяти: континенты выглядят так же, а кадр дешевле
+            // (каждая октава — восемь синусов на каждый фрагмент сферы).
             float value = 0.0;
             float amplitude = 0.5;
-            for (int i = 0; i < 5; i++) {
+            for (int i = 0; i < 4; i++) {
               value += amplitude * noise(p);
               p *= 2.05;
               amplitude *= 0.5;
@@ -265,7 +270,19 @@ export class NetworkScene implements SceneModule {
       );
       window.addEventListener('keydown', this.#onKeyDown);
       this.#unsubscribePrefs = this.#ctx.prefs.subscribe((prefs, changed) => {
-        if (changed.includes('networkGlobe')) this.#setGlobe(prefs.networkGlobe);
+        if (changed.includes('networkGlobe')) {
+          // Глобус без координат — заведомо пустая сцена: показываем граф и объясняем это.
+          if (prefs.networkGlobe && !this.#hasGeoData) {
+            this.#ctx.toast(
+              'warn',
+              'GeoIP ещё не подключён (этап 3): глобус был бы пустым. Открываю граф — ' +
+                'он показывает соединения уже сейчас (кнопка «Глобус» заработает после GeoIP).',
+            );
+            this.#ctx.prefs.set({ networkGlobe: false });
+            return;
+          }
+          this.#setGlobe(prefs.networkGlobe);
+        }
         if (changed.includes('networkPollMs')) void invoke('net_start', { pollMs: prefs.networkPollMs });
       });
       this.#activated = true;
@@ -363,7 +380,35 @@ export class NetworkScene implements SceneModule {
     this.#statusText = `${this.#connections.length} соединений · ${processes} процессов · ${remotes} хостов${
       this.#globeActive ? ` · от ${this.#originLabel}` : ''
     }`;
+    this.#updateDiagnostics();
     this.#renderPanel();
+  }
+
+  /**
+   * Есть ли в снимке хоть одна координата для глобуса. Без GeoIP (этап 3) глобус пуст:
+   * на нём остаются только координатная сетка и локальный маркер, и это похоже на «ничего нет».
+   */
+  get #hasGeoData(): boolean {
+    return this.#connections.some(
+      (connection) => connection.remote.lat !== undefined && connection.remote.lon !== undefined,
+    );
+  }
+
+  /**
+   * Переключение режима «граф ↔ глобус». В глобус без координат не пускаем: сначала объясняем,
+   * почему он будет пустым, и предлагаем вернуться в граф — иначе пользователь видит пустую сцену.
+   */
+  #requestMode(globe: boolean): void {
+    if (globe && !this.#hasGeoData) {
+      this.#ctx.toast(
+        'warn',
+        'GeoIP ещё не подключён (этап 3 — оффлайн-база MaxMind): на глобусе не будет точек хостов, ' +
+          'только координатная сетка. Остаюсь в графе — он показывает соединения уже сейчас.',
+      );
+      this.#ctx.prefs.set({ networkGlobe: false });
+      return;
+    }
+    this.#ctx.prefs.set({ networkGlobe: globe });
   }
 
   #setGlobe(active: boolean): void {
@@ -376,6 +421,9 @@ export class NetworkScene implements SceneModule {
     } else {
       this.#graph.sync(this.#connections);
       this.#orbit.setDistance(96);
+    }
+    for (const button of this.#modeButtons) {
+      button.classList.toggle('active', (button.dataset.mode === 'globe') === active);
     }
     this.#renderPanel();
   }
@@ -721,6 +769,7 @@ export class NetworkScene implements SceneModule {
     const modes = document.createElement('div');
     modes.className = 'hud-modes';
     modes.style.marginTop = '10px';
+    this.#modeButtons = [];
     for (const [id, label] of [
       ['graph', 'Граф'],
       ['globe', 'Глобус'],
@@ -728,10 +777,19 @@ export class NetworkScene implements SceneModule {
       const button = document.createElement('button');
       button.className = 'hud-btn';
       button.textContent = label;
-      button.addEventListener('click', () => this.#ctx.prefs.set({ networkGlobe: id === 'globe' }));
+      button.dataset.mode = id;
+      button.addEventListener('click', () => this.#requestMode(id === 'globe'));
+      this.#modeButtons.push(button);
       modes.appendChild(button);
     }
     inner.appendChild(modes);
+
+    // Строка диагностики 3D: сразу видно, дошли ли данные до сцены и какой режим активен.
+    const mode = document.createElement('div');
+    mode.className = 'hud-label';
+    mode.style.marginTop = '8px';
+    inner.appendChild(mode);
+    this.#panelMode = mode;
 
     const body = document.createElement('div');
     body.className = 'hud-scroll';
@@ -743,6 +801,19 @@ export class NetworkScene implements SceneModule {
     // Ссылка на список обновляется при каждом снимке — панель всегда актуальна.
     this.#renderPanel();
     return panel;
+  }
+
+  /** Что реально попало в 3D: узлы, рёбра и активный режим. */
+  #updateDiagnostics(): void {
+    if (!this.#panelMode) return;
+    if (this.#globeActive) {
+      const points = this.#globeData.length;
+      this.#panelMode.textContent = points
+        ? `в 3D: глобус · ${points} хостов с координатами`
+        : 'в 3D: глобус · нет координат (GeoIP — этап 3)';
+      return;
+    }
+    this.#panelMode.textContent = `в 3D: ${this.#graph.nodes.length} узлов · ${this.#graph.links.length} рёбер`;
   }
 
   #renderPanel(): void {
@@ -791,10 +862,13 @@ export class NetworkScene implements SceneModule {
       const hint = document.createElement('div');
       hint.className = 'hud-label';
       hint.style.marginTop = '10px';
-      hint.textContent =
-        this.#snapshot?.elevated === false
-          ? 'Без прав администратора: структура соединений есть, объём трафика — только с ETW (этап 3)'
-          : 'Данные GeoIP подключаются на этапе 3 (оффлайн-база MaxMind)';
+      hint.textContent = this.#hasGeoData
+        ? 'Кликните соединение в списке — покажу детали; по узлу на глобусе — что за хост'
+        : this.#snapshot?.elevated === false
+          ? 'Без прав администратора: соединения видны, объём трафика будет с ETW (этап 3), ' +
+            'координаты хостов — с GeoIP (этап 3), поэтому глобус пока пустой'
+          : 'Координаты хостов появятся с GeoIP (этап 3, оффлайн-база MaxMind) — до тех пор ' +
+            'работает граф';
       body.appendChild(hint);
     }
   }

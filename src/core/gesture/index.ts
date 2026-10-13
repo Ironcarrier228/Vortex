@@ -15,6 +15,7 @@
 import { CameraHandSource } from './handTracker';
 import { DemoHandSource } from './demoHand';
 import { GestureController } from './gestureController';
+import { economyRate } from './rate';
 import { GestureOverlay } from './overlay';
 import type { GestureName, GestureState, HandFrame, HandSource, SourceStatus } from './types';
 
@@ -42,6 +43,8 @@ export class GestureService {
   /** Камера не далась (нет устройства, запрет доступа) — показываем демо-руку. */
   #autoDemo = false;
   #demoReason = '';
+  /** Текущая частота распознавания (адаптируется под FPS рендера). */
+  #rateHz = 30;
 
   #eventListeners = new Set<(name: GestureName | 'hand-lost') => void>();
   #statusListeners = new Set<(status: SourceStatus, state: GestureState) => void>();
@@ -138,9 +141,14 @@ export class GestureService {
     }
   }
 
-  /** Кадр движка: обновить состояние, прокид в указатель и отрисовку оверлея. */
-  update(dt: number): void {
+  /**
+   * Кадр движка: состояние, прокид в указатель, оверлей и адаптация частоты распознавания.
+   * `renderFps` — FPS отрисовки: если он просел (модель и рендер делят один GPU),
+   * распознавание автоматически переходит в экономный режим.
+   */
+  update(dt: number, renderFps = 60): void {
     if (!this.#enabled) return;
+    this.#adaptRate(renderFps);
     this.controller.update(dt);
 
     const state = this.controller.state;
@@ -173,6 +181,19 @@ export class GestureService {
 
   /* ─────────────────────────── Внутреннее ─────────────────────────── */
 
+  /**
+   * Экономный режим. Пороги подобраны так, чтобы жесты оставались отзывчивыми:
+   * 30 Гц при свободном рендере, 20 Гц при 30–45 FPS, 12 Гц — если картинка совсем просела.
+   * Управление по-прежнему идёт с частотой кадров: сглаживание сглаживает и редкие кадры.
+   */
+  #adaptRate(renderFps: number): void {
+    const target = economyRate(renderFps);
+    if (target === this.#rateHz) return;
+    this.#rateHz = target;
+    this.#source?.setMaxHz?.(target);
+    this.#status = { ...this.#status, economy: target < 30 ? `${target} Гц` : undefined };
+  }
+
   async #startSource(): Promise<void> {
     if (this.#starting) return;
     this.#starting = true;
@@ -180,6 +201,7 @@ export class GestureService {
 
     const prefs = this.#prefs.get();
     const source: HandSource = prefs.handDemo ? new DemoHandSource() : new CameraHandSource();
+    source.setMaxHz?.(this.#rateHz);
     this.#source = source;
 
     this.#frameUnsub = source.onFrame((frame) => this.#onFrame(frame));
@@ -188,6 +210,7 @@ export class GestureService {
         ? { ...status, message: status.message ? `${status.message} · демо: ${this.#demoReason}` : `демо: ${this.#demoReason}` }
         : status;
       if (this.#autoDemo) this.#status.phase = 'running';
+      void 0;
       this.#overlay.video = source.kind === 'camera' ? (source as CameraHandSource).videoElement : null;
       this.#emitStatus(status);
     });
@@ -320,8 +343,8 @@ export function statusLabel(status: SourceStatus): string {
       return status.message ?? 'включаю камеру…';
     case 'running':
       return `жесты · ${Math.round(status.fps ?? 0)} FPS · ${status.delegate ?? 'CPU'}${
-        status.modelSource ? ` · модель: ${status.modelSource}` : ''
-      }`;
+        status.economy ? ` · эконом ${status.economy}` : ''
+      }${status.modelSource ? ` · модель: ${status.modelSource}` : ''}`;
     case 'error':
       return `ошибка: ${status.message ?? 'неизвестно'}`;
     default:
