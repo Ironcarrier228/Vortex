@@ -12,6 +12,7 @@ import * as THREE from 'three';
 
 import { invoke, listen } from '../../core/transport';
 import { OrbitCamera } from '../../core/interaction/orbit';
+import { angleDelta } from '../../core/gesture/landmarks';
 import { ForceGraph, type GraphNode } from './graph';
 import type { NetConnection, NetSnapshot } from '../../core/types';
 import type { SceneContext, SceneModule, SceneState } from '../../core/scene';
@@ -84,6 +85,8 @@ export class NetworkScene implements SceneModule {
   #dragPoint = new THREE.Vector3();
   #dragOffset = new THREE.Vector3();
   #projected = new THREE.Vector3();
+  /** Прошлый поворот кисти: приращение вращает «вырванный» узел. */
+  #lastRoll = 0;
 
   constructor(ctx: SceneContext) {
     this.#ctx = ctx;
@@ -332,6 +335,14 @@ export class NetworkScene implements SceneModule {
     this.#orbit.reset();
   }
 
+  /** Вернуть узлы в физику (кнопка в панели). Камеру не трогаем. */
+  #releaseAllNodes(): void {
+    this.#releaseDrag();
+    this.#graph.unpinAll();
+    this.#dragCandidate = null;
+    this.#ctx.toast('info', 'Узлы возвращены в физику графа');
+  }
+
   /** Две руки: разведение — зум, поворот кистей — вращение вокруг центра. */
   controlOrbit(zoom: number, twist: number): void {
     this.#orbit.zoomBy(zoom);
@@ -548,6 +559,12 @@ export class NetworkScene implements SceneModule {
     this.#dragging = true;
     this.#dragCandidate = null;
     this.#graph.beginDrag(node);
+    // «Вырвать из цепочки»: узел раздувается для осмотра, а панель сразу показывает
+    // его запросы — пока держим, видно, куда он ходит.
+    this.#graph.setBoost(node, 1);
+    this.#lastRoll = this.#ctx.gesture.state.roll;
+    this.#selected = node;
+    this.#renderPanel();
     // Камера не должна крутиться, пока тянем узел мышью.
     this.#orbit.setSuspended(true);
     this.#ctx.gesture.setGrabbed(true);
@@ -578,6 +595,16 @@ export class NetworkScene implements SceneModule {
           y: (-this.#projected.y * 0.5 + 0.5) * window.innerHeight,
         });
       }
+
+      // «Покрутить»: поворот кисти вращает рассматриваемый узел.
+      const node = this.#graph.dragged;
+      if (node) {
+        const roll = this.#ctx.gesture.state.roll;
+        const delta = angleDelta(this.#lastRoll, roll);
+        // Большие скачки — это потеря/перехват руки, а не поворот: их игнорируем.
+        if (Math.abs(delta) < 0.7) this.#graph.spinBy(node, delta * 1.8);
+        this.#lastRoll = roll;
+      }
       return;
     }
 
@@ -592,16 +619,36 @@ export class NetworkScene implements SceneModule {
     this.#dragCandidate = null;
   }
 
-  /** Отпустить узел: он остаётся закреплённым там, где его оставили (снимается «кулаком»). */
+  /**
+   * Отпустить узел: он **остаётся** там, где его оставили (закрепление в d3-force),
+   * размер плавно возвращается к обычному. Вернуть всё в физику — кнопкой «Вернуть узлы»
+   * или жестом «кулак» (если он включён в настройках).
+   */
   #releaseDrag(): void {
     if (!this.#dragging) return;
     this.#dragging = false;
     this.#orbit.setSuspended(false);
     const node = this.#graph.dragged;
+    if (node) this.#graph.setBoost(node, 0);
     this.#graph.endDrag(true);
     this.#ctx.gesture.setGrabbed(false);
     this.#ctx.gesture.setTether(null);
-    if (node) this.#ctx.toast('info', `Узел «${node.label}» закреплён · кулак снимает закрепление`);
+    if (node) {
+      const requests = this.#requestsOf(node).length;
+      this.#ctx.toast(
+        'info',
+        `Узел «${node.label}» вырван из цепочки и оставлен · запросов: ${requests} · панель слева показывает их`,
+      );
+    }
+  }
+
+  /** Запросы (соединения), которые идут через узел: процесс → его соединения, хост → кто к нему ходит. */
+  #requestsOf(node: GraphNode): NetConnection[] {
+    return this.#connections.filter(
+      (connection) =>
+        (node.kind === 'process' && connection.process === node.process) ||
+        (node.kind === 'remote' && connection.remote.ip === node.ip),
+    );
   }
 
   /** Короткое нажатие = выбор узла (мышью или щипком). */
@@ -784,6 +831,18 @@ export class NetworkScene implements SceneModule {
     }
     inner.appendChild(modes);
 
+    // Вернуть расстановку: узлы, которые «вырвали» и оставили, снова ловит физика.
+    const returnRow = document.createElement('div');
+    returnRow.className = 'hud-modes';
+    returnRow.style.marginTop = '6px';
+    const returnButton = document.createElement('button');
+    returnButton.className = 'hud-btn';
+    returnButton.textContent = 'Вернуть узлы';
+    returnButton.title = 'Снять закрепления: все вырванные узлы возвращаются в раскладку';
+    returnButton.addEventListener('click', () => this.#releaseAllNodes());
+    returnRow.appendChild(returnButton);
+    inner.appendChild(returnRow);
+
     // Строка диагностики 3D: сразу видно, дошли ли данные до сцены и какой режим активен.
     const mode = document.createElement('div');
     mode.className = 'hud-label';
@@ -828,8 +887,24 @@ export class NetworkScene implements SceneModule {
           (node.kind === 'process' && connection.process === node.process) ||
           (node.kind === 'remote' && connection.remote.ip === node.ip),
       );
+      const requests = this.#requestsOf(node);
+      const protocols = new Map<string, number>();
+      for (const connection of requests) {
+        protocols.set(connection.protocol, (protocols.get(connection.protocol) ?? 0) + 1);
+      }
+      const breakdown = [...protocols.entries()]
+        .sort((a, b) => b[1] - a[1])
+        .map(([protocol, count]) => `${protocol.toUpperCase()} ${count}`)
+        .join(' · ');
+      const pinned = node.fx !== null && node.fx !== undefined;
       body.innerHTML = `<div class="hud-label">${escapeHtml(node.kind === 'process' ? 'процесс' : node.kind === 'remote' ? 'удалённый хост' : 'машина')}</div>
-        <div style="font-size:13px;margin:4px 0 10px">${escapeHtml(node.label)}</div>`;
+        <div style="font-size:13px;margin:4px 0 6px">${escapeHtml(node.label)}</div>
+        <div class="hud-field-value">запросов: ${requests.length}${breakdown ? ` · ${escapeHtml(breakdown)}` : ''}</div>
+        ${
+          pinned
+            ? '<div class="hud-label" style="margin-top:6px">вырван из цепочки и оставлен · «Вернуть узлы» снимает закрепление</div>'
+            : '<div class="hud-label" style="margin-top:6px">щипок/зажать — вырвать узел и покрутить кистью; панель покажет его запросы</div>'
+        }`;
       const list = document.createElement('div');
       list.className = 'hud-group';
       for (const connection of rows.slice(0, 40)) {

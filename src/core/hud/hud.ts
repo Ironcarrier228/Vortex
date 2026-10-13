@@ -280,16 +280,19 @@ export class Hud {
     inner.appendChild(this.#switchField('Зеркалить движение', 'handMirror'));
     inner.appendChild(this.#switchField('Показывать скелет кисти', 'handShowSkeleton'));
     inner.appendChild(this.#switchField('Превью камеры', 'handShowPreview'));
-    inner.appendChild(this.#switchField('Пауза ладонью', 'handPauseGesture'));
+    // Свайпы и пауза ладонью выключены по умолчанию (срабатывали случайно) — включаются тут.
+    inner.appendChild(this.#switchField('Свайп переключает сцены', 'handSwipeScenes'));
+    inner.appendChild(this.#switchField('Пауза открытой ладонью', 'handPauseGesture'));
+    inner.appendChild(this.#switchField('Кулак возвращает раскладку', 'handFistReset'));
     inner.appendChild(this.#sliderField('Усиление движения', 'handSensitivity', 0.6, 2.5, 0.05));
     inner.appendChild(this.#sliderField('Сглаживание', 'handSmoothing', 0, 0.95, 0.05));
     inner.appendChild(
       el(
         'div',
         'hud-label',
-        'Щипок двумя пальцами — взять узел и перетащить. Ладонь (удержание) — пауза, ' +
-          'кулак — сброс вида, свайп — смена сцены, большой палец вверх — действие сцены, ' +
-          'две руки — зум и поворот.',
+        'Щипок двумя пальцами — вырвать узел из цепочки: узел растёт, панель сцены показывает ' +
+          'его запросы, кистью можно его повернуть, а на отпускании он остаётся там, где вы его ' +
+          'оставили. Большой палец вверх — действие сцены, две руки — зум и поворот.',
       ),
     );
 

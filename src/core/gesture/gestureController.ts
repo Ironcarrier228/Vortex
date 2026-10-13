@@ -13,8 +13,10 @@
 
 import { TypedEmitter } from '../events';
 import {
+  MIDDLE_MCP,
   PINCH_ENTER,
   PINCH_EXIT,
+  WRIST,
   angleBetween,
   angleDelta,
   classifyPose,
@@ -32,8 +34,12 @@ export interface GestureOptions {
   sensitivity: number;
   /** Сглаживание 0…0.95. */
   smoothing: number;
-  /** Пауза открытой ладонью. */
+  /** Пауза открытой ладонью. По умолчанию выключена: срабатывала случайно. */
   pauseGesture: boolean;
+  /** Свайп ладонью (смена сцены). По умолчанию выключен — переключать сцены им неудобно. */
+  swipes: boolean;
+  /** Кулак как «вернуть раскладку». По умолчанию выключен: можно сбросить расстановку случайно. */
+  fistReset: boolean;
 }
 
 /** Сколько держать позу, чтобы сработал командный жест (сек). */
@@ -60,6 +66,7 @@ export class GestureController {
     cursor: { active: false, ndcX: 0, ndcY: 0, screenX: 0, screenY: 0 },
     pinch: { strength: 0, active: false, progress: 0 },
     grabbed: false,
+    roll: 0,
     twoHand: { active: false, scale: 1, twist: 0, centerX: 0, centerY: 0 },
     holdLabel: null,
     holdProgress: 0,
@@ -84,6 +91,8 @@ export class GestureController {
   #rawPinchRatio = 1;
   #rawSecondaryPinchRatio = 1;
   #rawScale: number | null = null;
+  #rawRoll = 0;
+  #roll = 0;
   #rawPose: HandPose = 'none';
   #poseSince = 0;
 
@@ -168,6 +177,12 @@ export class GestureController {
       this.#rawPose = this.#stickyPose(classifyPose(primary.landmarks, primaryPinch < PINCH_ENTER));
     }
 
+    // Поворот кисти: вектор «запястье → основание среднего пальца».
+    // 0 — пальцы вверх, растёт по часовой; этим вращается рассматриваемый объект.
+    const wrist = primary.landmarks[WRIST];
+    const middle = primary.landmarks[MIDDLE_MCP];
+    this.#rawRoll = Math.atan2(middle.x - wrist.x, -(middle.y - wrist.y));
+
     // Ручной масштаб кисти — для отладки и подсказок в HUD.
     this.#handScaleSnapshot = handScale(primary.landmarks);
   }
@@ -236,6 +251,10 @@ export class GestureController {
     else if (wasPinching && ratio > PINCH_EXIT) this.state.pinch.active = false;
     this.state.pinch.strength = Math.min(1, Math.max(0, (PINCH_EXIT - ratio) / (PINCH_EXIT - PINCH_ENTER * 0.6)));
     this.state.secondaryPinch = this.#rawSecondaryPinchRatio < PINCH_ENTER;
+
+    // ── Поворот кисти (им вращается «вырванный» объект).
+    this.#roll += angleDelta(this.#roll, this.#rawRoll) * Math.min(1, dt * 14);
+    this.state.roll = this.#roll;
 
     // ── Поза.
     this.state.pose = this.#rawPose;
@@ -328,6 +347,7 @@ export class GestureController {
 
   /** Свайп открытой ладонью влево/вправо. */
   #updateSwipe(dt: number): void {
+    if (!this.#options.swipes) return;
     if (this.#swipeCooldown > 0) this.#swipeCooldown -= dt;
     const palmX = this.state.cursor.ndcX;
     const velocity = dt > 0 ? (palmX - this.#lastPalmX) / dt : 0;
@@ -358,10 +378,12 @@ export class GestureController {
     if (this.#cooldown > 0) this.#cooldown -= dt;
 
     const pose = this.state.pose;
-    const isHoldPose = pose === 'open' || pose === 'fist' || pose === 'thumbsUp';
-    const pauseEnabled = this.#options.pauseGesture || pose !== 'open';
+    // Что вообще может сработать: «класс» всегда, ладонь и кулак — только если включены.
+    const allowed =
+      pose === 'thumbsUp' || (pose === 'open' && this.#options.pauseGesture) || (pose === 'fist' && this.#options.fistReset);
+    const isHoldPose = allowed && (pose === 'open' || pose === 'fist' || pose === 'thumbsUp');
 
-    if (!isHoldPose || !pauseEnabled || this.#cooldown > 0 || this.state.pinch.active) {
+    if (!isHoldPose || pose === undefined || this.#cooldown > 0 || this.state.pinch.active) {
       this.#poseHold = 0;
       this.#poseHoldTarget = null;
       this.state.holdLabel = null;
@@ -409,6 +431,8 @@ export class GestureController {
     this.state.pinch.strength = 0;
     this.state.pinch.progress = 0;
     this.state.grabbed = false;
+    this.state.roll = 0;
+    this.#roll = 0;
     this.state.twoHand.active = false;
     this.state.holdLabel = null;
     this.state.holdProgress = 0;

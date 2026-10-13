@@ -58,6 +58,12 @@ export interface GraphNode {
   fy?: number | null;
   fz?: number | null;
   index?: number;
+  /** 0..1 — насколько узел «раздут» для осмотра (растёт, пока его держат). */
+  boost?: number;
+  /** Куда стремится boost. */
+  boostTarget?: number;
+  /** Накопленный поворот узла (кистью/мышью при удержании), радианы. */
+  spin?: number;
 }
 
 export interface GraphLink {
@@ -101,6 +107,8 @@ export class ForceGraph {
   #selection = new THREE.Color();
   #tempColor = new THREE.Color();
   #dragged: GraphNode | null = null;
+  /** Вращающаяся оболочка вокруг «вырванного» узла: делает поворот видимым. */
+  #inspectShell: THREE.Mesh;
 
   constructor() {
     this.#localNode = {
@@ -162,6 +170,23 @@ export class ForceGraph {
     );
     this.#linksMesh.frustumCulled = false;
     this.object.add(this.#linksMesh);
+
+    // Оболочка «вырванного» узла: каркасный икосаэдр, вращается вместе с ним.
+    // Обычная сфера при вращении не видна, а каркас сразу показывает поворот.
+    this.#inspectShell = new THREE.Mesh(
+      new THREE.IcosahedronGeometry(1, 1),
+      new THREE.MeshBasicMaterial({
+        color: 0xf472b6,
+        wireframe: true,
+        transparent: true,
+        opacity: 0.55,
+        blending: THREE.AdditiveBlending,
+        depthWrite: false,
+      }),
+    );
+    this.#inspectShell.visible = false;
+    this.#inspectShell.frustumCulled = false;
+    this.object.add(this.#inspectShell);
 
     // Импульсы.
     this.#pulsePositions = new Float32Array(MAX_PULSES * 3).fill(1e6);
@@ -343,6 +368,10 @@ export class ForceGraph {
       node.intensity += (node.target - node.intensity) * Math.min(1, dt * 1.6);
       node.target = Math.max(node.target - dt * 0.12, node.kind === 'local' ? 0.35 : 0.12);
       node.degree = node.degree || 1;
+      // Раздувание для осмотра: быстро растёт, мягко возвращается.
+      const boostTarget = node.boostTarget ?? 0;
+      const boost = node.boost ?? 0;
+      node.boost = boost + (boostTarget - boost) * Math.min(1, dt * (boostTarget > boost ? 7 : 4));
     }
 
     const matrix = new THREE.Matrix4();
@@ -352,7 +381,8 @@ export class ForceGraph {
       const pulse = 1 + Math.sin(time * (2.4 + node.intensity * 3) + i) * 0.08 * node.intensity;
       const base =
         node.kind === 'local' ? 5.4 : node.kind === 'process' ? 2.1 + Math.min(node.degree, 12) * 0.12 : 1.35;
-      const size = base * (0.85 + node.intensity * 0.55) * pulse;
+      const inspect = 1 + (node.boost ?? 0) * (node.kind === 'remote' ? 2.6 : 1.9);
+      const size = base * (0.85 + node.intensity * 0.55) * pulse * inspect;
       scale.setScalar(size);
       matrix.makeScale(scale.x, scale.y, scale.z);
       matrix.setPosition(node.x ?? 0, node.y ?? 0, node.z ?? 0);
@@ -375,6 +405,20 @@ export class ForceGraph {
       this.#nodeMesh.setColorAt(i, color);
     }
     this.#nodeMesh.count = Math.max(1, this.nodes.length);
+
+    // Оболочка рассматриваемого узла: следует за ним и вращается.
+    const inspected = this.#dragged;
+    if (inspected) {
+      this.#inspectShell.visible = true;
+      this.#inspectShell.position.set(inspected.x ?? 0, inspected.y ?? 0, inspected.z ?? 0);
+      const shellScale =
+        (inspected.kind === 'local' ? 5.4 : inspected.kind === 'process' ? 2.6 : 1.6) *
+        (1 + (inspected.boost ?? 0) * 2.2);
+      this.#inspectShell.scale.setScalar(shellScale);
+      this.#inspectShell.rotation.set((inspected.spin ?? 0) * 0.35, inspected.spin ?? 0, 0);
+    } else {
+      this.#inspectShell.visible = false;
+    }
     this.#nodeMesh.instanceMatrix.needsUpdate = true;
     if (this.#nodeMesh.instanceColor) this.#nodeMesh.instanceColor.needsUpdate = true;
 
@@ -515,13 +559,40 @@ export class ForceGraph {
     this.#simulation.alpha(Math.max(this.#simulation.alpha(), 0.45));
   }
 
-  /** Снять все закрепления (жест «кулак» / кнопка сброса). */
+  /**
+   * Раздуть узел для осмотра (пока его держат): узел растёт, вокруг появляется вращающийся
+   * каркас. `target = 0` — плавно вернуть к обычному размеру (после отпускания).
+   */
+  setBoost(node: GraphNode, target: number, spin = node.spin ?? 0): void {
+    node.boostTarget = target;
+    node.spin = spin;
+    if (target > 0 && this.#dragged !== node) {
+      this.#dragged = node;
+      node.fx = node.x ?? 0;
+      node.fy = node.y ?? 0;
+      node.fz = node.z ?? 0;
+      this.#simulation.alpha(Math.max(this.#simulation.alpha(), 0.4));
+    }
+    // Осмотр закончен: узел остаётся там, где его оставили (закрепление не снимаем).
+    if (target === 0 && this.#dragged === node) this.#dragged = null;
+  }
+
+  /** Повернуть рассматриваемый узел (кистью при удержании). */
+  spinBy(node: GraphNode, delta: number): void {
+    node.spin = (node.spin ?? 0) + delta;
+  }
+
+  /** Снять все закрепления и вернуть узлы в физику (кнопка «Вернуть узлы», жест «кулак»). */
   unpinAll(): void {
     for (const node of this.nodes) {
       node.fx = null;
       node.fy = null;
       node.fz = null;
+      node.boostTarget = 0;
+      node.spin = 0;
     }
+    this.#dragged = null;
+    this.#inspectShell.visible = false;
     this.#simulation.alpha(Math.max(this.#simulation.alpha(), 0.6));
   }
 

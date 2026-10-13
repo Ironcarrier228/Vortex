@@ -121,24 +121,12 @@ class App implements AppHost {
    *  • большой палец вверх → действие в контексте сцены.
    */
   #wireGestures(params: URLSearchParams): void {
-    const ORDER: SceneId[] = ['audio', 'network', 'disk'];
-
     this.gesture.onEvent((name) => {
       if (this.outputMode) return;
       switch (name) {
-        case 'swipe-right': {
-          const index = ORDER.indexOf(this.currentScene());
-          this.setScene(ORDER[(index + 1) % ORDER.length]);
-          break;
-        }
-        case 'swipe-left': {
-          const index = ORDER.indexOf(this.currentScene());
-          this.setScene(ORDER[(index - 1 + ORDER.length) % ORDER.length]);
-          break;
-        }
-        case 'palm-pause':
-          this.togglePause();
-          break;
+        // Свайпы и «пауза ладонью» намеренно не обрабатываются: они срабатывали случайно
+        // (пользователь: «убери пролистывание и почему-то на паузу ставится»). Детекторы
+        // остаются в контроллере и включаются префами handSwipeScenes / handPauseGesture.
         case 'fist-reset': {
           const module = this.#engine.currentModule;
           module?.resetView?.();
@@ -168,7 +156,7 @@ class App implements AppHost {
           'info',
           manualDemo
             ? 'Демо-рука включена: кисть синтетическая, камера не используется'
-            : 'Руки распознаются: щипок — взять узел, ладонь — пауза, свайп — смена сцены',
+            : 'Руки распознаются: щипок — вырвать узел и покрутить кистью, панель сцены покажет его запросы',
         );
       }
       if (status.phase === 'error' && this.#lastGestureStatus !== 'error') {

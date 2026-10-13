@@ -93,6 +93,8 @@ export interface GestureState {
   /** Две руки: зум и поворот сцены. */
   twoHand: { active: boolean; scale: number; twist: number; centerX: number; centerY: number };
   /** Подпись текущего удержания («пауза», «сброс», «действие») и его прогресс 0..1. */
+  /** Поворот кисти в кадре (радианы): 0 — пальцы вверх, растёт по часовой. */
+  roll: number;
   holdLabel: string | null;
   holdProgress: number;
   /** Вторая рука (для сцен, которым нужна отдельная логика). */

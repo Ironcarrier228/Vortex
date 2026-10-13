@@ -14,7 +14,7 @@
 
 import { CameraHandSource } from './handTracker';
 import { DemoHandSource } from './demoHand';
-import { GestureController } from './gestureController';
+import { GestureController, type GestureOptions as GestureControllerOptions } from './gestureController';
 import { economyRate } from './rate';
 import { GestureOverlay } from './overlay';
 import type { GestureName, GestureState, HandFrame, HandSource, SourceStatus } from './types';
@@ -54,12 +54,7 @@ export class GestureService {
     this.#pointer = options.pointer;
 
     const prefs = options.prefs.get();
-    this.controller = new GestureController({
-      mirror: prefs.handMirror,
-      sensitivity: prefs.handSensitivity,
-      smoothing: prefs.handSmoothing,
-      pauseGesture: prefs.handPauseGesture,
-    });
+    this.controller = new GestureController(GestureService.optionsFrom(prefs));
     // Контроллер владеет разбором жестов, сервис — их рассылкой.
     this.#forwardControllerEvents();
 
@@ -181,6 +176,18 @@ export class GestureService {
 
   /* ─────────────────────────── Внутреннее ─────────────────────────── */
 
+  /** Префы → опции контроллера (единое место: и при создании, и при изменениях). */
+  private static optionsFrom(prefs: ReturnType<PrefsStore['get']>): GestureControllerOptions {
+    return {
+      mirror: prefs.handMirror,
+      sensitivity: prefs.handSensitivity,
+      smoothing: prefs.handSmoothing,
+      pauseGesture: prefs.handPauseGesture,
+      fistReset: prefs.handFistReset,
+      swipes: prefs.handSwipeScenes,
+    };
+  }
+
   /**
    * Экономный режим. Пороги подобраны так, чтобы жесты оставались отзывчивыми:
    * 30 Гц при свободном рендере, 20 Гц при 30–45 FPS, 12 Гц — если картинка совсем просела.
@@ -271,12 +278,7 @@ export class GestureService {
     const handKeys = changed.filter((key) => String(key).startsWith('hand'));
     if (handKeys.length === 0) return;
 
-    this.controller.setOptions({
-      mirror: prefs.handMirror,
-      sensitivity: prefs.handSensitivity,
-      smoothing: prefs.handSmoothing,
-      pauseGesture: prefs.handPauseGesture,
-    });
+    this.controller.setOptions(GestureService.optionsFrom(prefs));
 
     if (changed.includes('handShowSkeleton') || changed.includes('handShowPreview')) {
       this.#overlay.setVisible(prefs.handShowSkeleton || prefs.handShowPreview);

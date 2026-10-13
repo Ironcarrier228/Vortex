@@ -54,8 +54,15 @@ export interface Prefs {
   handSensitivity: number;
   /** Сглаживание курсора 0…0.95 (One Euro Filter). */
   handSmoothing: number;
-  /** Пауза жестом открытой ладони (удержание). */
+  /**
+   * Пауза жестом открытой ладони. По умолчанию выключена: срабатывала случайно,
+   * когда рука просто висела раскрытой (пользователь: «на паузу ставится иногда»).
+   */
   handPauseGesture: boolean;
+  /** Кулак «вернуть раскладку» — тоже выключен: сбрасывал расстановку узлов случайно. */
+  handFistReset: boolean;
+  /** Свайп ладонью переключает сцены. Выключен: сцены переключаются вкладками и клавишами 1–3. */
+  handSwipeScenes: boolean;
 }
 
 export const DEFAULT_PREFS: Prefs = {
@@ -96,7 +103,9 @@ export const DEFAULT_PREFS: Prefs = {
   handShowPreview: false,
   handSensitivity: 1.2,
   handSmoothing: 0.55,
-  handPauseGesture: true,
+  handPauseGesture: false,
+  handFistReset: false,
+  handSwipeScenes: false,
 };
 
 const STORAGE_KEY = 'vortex.prefs.v1';

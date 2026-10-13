@@ -30,6 +30,7 @@ import { DemoHandSource } from '../src/core/gesture/demoHand';
 import { loadMediaPipe } from '../src/core/gesture/mediapipe';
 import { PointerHub } from '../src/core/interaction/pointer';
 import { economyRate } from '../src/core/gesture/rate';
+import { ForceGraph } from '../src/scenes/network/graph';
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { runInThisContext } from 'node:vm';
@@ -138,7 +139,16 @@ async function main(): Promise<void> {
 
   console.log('Жесты: контроллер (кадры распознавания 30 Гц + кадры рендера 60 Гц)');
   const seen: string[] = [];
-  const controller = new GestureController({ mirror: false, sensitivity: 1.2, smoothing: 0.5, pauseGesture: true });
+  const controller = new GestureController({
+    mirror: false,
+    sensitivity: 1.2,
+    smoothing: 0.5,
+    // Свайпы и пауза по умолчанию выключены (срабатывали случайно) — в тесте включаем,
+    // чтобы проверить сами детекторы, которые остались в контроллере.
+    pauseGesture: true,
+    swipes: true,
+    fistReset: true,
+  });
   for (const name of ['swipe-left', 'swipe-right', 'palm-pause', 'fist-reset', 'thumbs-up', 'hand-lost'] as const) {
     controller.on(name, () => seen.push(name));
   }
@@ -206,6 +216,124 @@ async function main(): Promise<void> {
   controller.update(0.6);
   check(!controller.state.cursor.active, 'без кадров курсор гаснет (hand-lost)');
   check(seen.includes('hand-lost'), 'сцена получает событие hand-lost');
+
+  console.log('Сеть: узел «вырвать — покрутить — оставить»');
+  const inspectGraph = new ForceGraph();
+  const inspectConnections: NetConnection[] = Array.from({ length: 12 }, (_, index) => ({
+    id: `tcp:${index}`,
+    protocol: 'tcp',
+    state: 'ESTABLISHED',
+    pid: 4200 + index,
+    process: index < 6 ? 'svchost' : 'node',
+    local: { ip: '192.168.0.10', port: 50_000 + index },
+    remote: { ip: `93.184.216.${index}`, port: 443, host: `host-${index}` },
+  }) as NetConnection);
+  inspectGraph.sync(inspectConnections);
+  for (let frame = 0; frame < 120; frame++) inspectGraph.update(1 / 60, frame / 60, null);
+
+  const pulled = inspectGraph.nodes.find((node) => node.kind === 'process')!;
+  check(Boolean(pulled), `в графе есть узел-процесс (${pulled?.label})`);
+
+  // «Вырвать»: узел закрепляется и раздувается для осмотра.
+  inspectGraph.beginDrag(pulled);
+  inspectGraph.setBoost(pulled, 1);
+  for (let frame = 0; frame < 40; frame++) inspectGraph.update(1 / 60, frame / 60, null);
+  check(pulled.fx !== null && pulled.fx !== undefined, 'вырванный узел закреплён (физика его не тянет)');
+  check((pulled.boost ?? 0) > 0.85, `узел раздулся для осмотра (boost ${(pulled.boost ?? 0).toFixed(2)})`);
+
+  // «Покрутить»: поворот кисти накапливается.
+  inspectGraph.spinBy(pulled, 1.2);
+  inspectGraph.spinBy(pulled, 0.8);
+  check(Math.abs((pulled.spin ?? 0) - 2) < 1e-6, `поворот накопился (${(pulled.spin ?? 0).toFixed(2)} рад)`);
+
+  // «Оставить»: узел возвращается к обычному размеру, но остаётся закреплённым там, где его отпустили.
+  const leftAt = { x: pulled.x, y: pulled.y, z: pulled.z };
+  inspectGraph.endDrag(true);
+  inspectGraph.setBoost(pulled, 0);
+  for (let frame = 0; frame < 90; frame++) inspectGraph.update(1 / 60, frame / 60, null);
+  check((pulled.boost ?? 0) < 0.05, `после отпускания узел вернулся к обычному размеру (${(pulled.boost ?? 0).toFixed(2)})`);
+  const drift = Math.hypot((pulled.x ?? 0) - (leftAt.x ?? 0), (pulled.y ?? 0) - (leftAt.y ?? 0), (pulled.z ?? 0) - (leftAt.z ?? 0));
+  check(drift < 0.5, `узел остался там, где его оставили (сдвиг ${drift.toFixed(2)})`);
+  check(pulled.fx !== null && pulled.fx !== undefined, 'узел остаётся вырванным из цепочки');
+
+  // «Вернуть узлы»: закрепления и раздувание снимаются.
+  inspectGraph.unpinAll();
+  check(pulled.fx === null && pulled.fy === null && pulled.fz === null, 'кнопка «Вернуть узлы» снимает закрепление');
+  check((pulled.spin ?? 0) === 0 && (pulled.boostTarget ?? 0) === 0, 'поворот и раздувание сброшены');
+  for (let frame = 0; frame < 120; frame++) inspectGraph.update(1 / 60, frame / 60, null);
+  const moved = inspectGraph.nodes.some((node) => node.kind !== 'local' && node.fx !== null && node.fx !== undefined);
+  check(!moved, 'после возврата ни один узел не закреплён');
+  inspectGraph.dispose();
+
+  console.log('Жесты: поведение по умолчанию (без случайных пауз и перелистывания)');
+  const quiet = new GestureController({
+    mirror: false,
+    sensitivity: 1.2,
+    smoothing: 0.5,
+    pauseGesture: false,
+    swipes: false,
+    fistReset: false,
+  });
+  const quietEvents: string[] = [];
+  for (const name of ['swipe-left', 'swipe-right', 'palm-pause', 'fist-reset', 'thumbs-up'] as const) {
+    quiet.on(name, () => quietEvents.push(name));
+  }
+
+  let quietClock = 0;
+  const quietRun = (landmarks: Landmark[], frames: number): void => {
+    for (let i = 0; i < frames; i++) {
+      quietClock += step;
+      if (i % 2 === 0) {
+        quiet.push({ hands: [{ landmarks, handedness: 'Right', score: 0.95 }], timestampMs: quietClock * 1000, inferenceMs: 3 });
+      }
+      quiet.update(step);
+    }
+  };
+
+  // Ладонь держим долго: раньше это ставило визуализацию на паузу.
+  quietRun(openHand, 120);
+  check(!quietEvents.includes('palm-pause'), 'ладонь больше не ставит паузу');
+
+  // Быстрый мах ладонью: раньше это переключало сцену.
+  for (let i = 0; i <= 12; i++) {
+    quietClock += step;
+    quiet.push({
+      hands: [{ landmarks: makeSyntheticHand({ centerX: 0.22 + (i / 12) * 0.7, centerY: 0.5, size: 0.22, openness: 1 }), handedness: 'Right', score: 0.95 }],
+      timestampMs: quietClock * 1000,
+      inferenceMs: 3,
+    });
+    quiet.update(step);
+  }
+  check(
+    !quietEvents.includes('swipe-left') && !quietEvents.includes('swipe-right'),
+    `мах ладонью больше не листает сцены (${quietEvents.join(', ') || 'событий нет'})`,
+  );
+
+  // Кулак: раньше сбрасывал расстановку узлов.
+  quietRun(fistHand, 120);
+  check(!quietEvents.includes('fist-reset'), 'кулак больше не сбрасывает раскладку');
+
+  // «Класс» остаётся: это осознанный жест.
+  quietRun(thumbsHand, 90);
+  check(quietEvents.includes('thumbs-up'), '«класс» продолжает работать (действие сцены)');
+
+  // Поворот кисти: им сцена вращает «вырванный» узел.
+  const rolled = makeSyntheticHand({ centerX: 0.5, centerY: 0.5, size: 0.22, openness: 1, rotation: 0 });
+  const rolledRight = makeSyntheticHand({ centerX: 0.5, centerY: 0.5, size: 0.22, openness: 1, rotation: Math.PI / 3 });
+  quietRun(rolled, 30);
+  const rollBefore = quiet.state.roll;
+  for (let i = 0; i < 30; i++) {
+    quietClock += step;
+    if (i % 2 === 0) {
+      quiet.push({ hands: [{ landmarks: rolledRight, handedness: 'Right', score: 0.95 }], timestampMs: quietClock * 1000, inferenceMs: 3 });
+    }
+    quiet.update(step);
+  }
+  const rollAfter = quiet.state.roll;
+  check(
+    Math.abs(rollAfter - rollBefore) > 0.3,
+    `поворот кисти доходит до сцены (${rollBefore.toFixed(2)} → ${rollAfter.toFixed(2)} рад)`,
+  );
 
   console.log('Жесты: демо-источник (превью без камеры)');
   const demo = new DemoHandSource();
