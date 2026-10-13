@@ -29,6 +29,13 @@ interface GlobePoint {
 
 /** Перемещение курсора (в NDC), после которого нажатие считается перетаскиванием. */
 const DRAG_TRIGGER_NDC = 0.012;
+/** Радиус захвата мышью. */
+const GRAB_RADIUS_MOUSE = 0.045;
+/**
+ * Радиус захвата рукой — заметно больше: палец в воздухе дрожит, поэтому «щипок рядом
+ * с узлом» должен узел брать, иначе жест кажется неработающим.
+ */
+const GRAB_RADIUS_HAND = 0.085;
 /** Максимальное удаление узла от центра сцены при перетаскивании (мировые единицы). */
 const NODE_DRAG_LIMIT = 190;
 
@@ -548,10 +555,15 @@ export class NetworkScene implements SceneModule {
   #onPointerPress(): void {
     if (this.#globeActive) return;
     this.#syncPointer();
-    const node = this.#graph.hitTest(this.camera, this.#ndc.x, this.#ndc.y);
+    const node = this.#graph.hitTest(this.camera, this.#ndc.x, this.#ndc.y, this.#grabRadius);
     this.#hovered = node;
     this.#dragCandidate = node;
     this.#dragStartNdc.copy(this.#ndc);
+  }
+
+  /** Радиус захвата: рукой целимся крупнее, мышью — точнее. */
+  get #grabRadius(): number {
+    return this.#ctx.pointer.state.source === 'hand' ? GRAB_RADIUS_HAND : GRAB_RADIUS_MOUSE;
   }
 
   /** Начало фактического перетаскивания: узел закрепляется и следует за указателем. */
@@ -608,9 +620,22 @@ export class NetworkScene implements SceneModule {
       return;
     }
 
-    // Ждём подтверждения: указатель сдвинулся достаточно далеко от точки нажатия.
     const candidate = this.#dragCandidate;
-    if (!candidate || !this.#ctx.pointer.state.pressed) return;
+    const pointer = this.#ctx.pointer.state;
+    if (!pointer.pressed) return;
+
+    // Рукой щипок мог случиться рядом с узлом: пока палец сжат, продолжаем искать узел
+    // под курсором и берём первый же — иначе жест выглядит «неработающим».
+    if (!candidate) {
+      if (pointer.source !== 'hand') return;
+      const node = this.#graph.hitTest(this.camera, this.#ndc.x, this.#ndc.y, GRAB_RADIUS_HAND);
+      if (!node) return;
+      this.#hovered = node;
+      this.#beginDrag(node);
+      return;
+    }
+
+    // Обычный путь: указатель сдвинулся достаточно далеко от точки нажатия.
     if (this.#ndc.distanceTo(this.#dragStartNdc) > DRAG_TRIGGER_NDC) this.#beginDrag(candidate);
   }
 

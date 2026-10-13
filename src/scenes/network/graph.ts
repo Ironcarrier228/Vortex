@@ -74,6 +74,18 @@ export interface GraphLink {
   /** 0..1 — насколько «горячее» соединение (для цвета рёбер). */
   heat: number;
   kind: 'local-process' | 'process-remote';
+
+  /* ── Резинка: поведение соединения, когда его узел вырвали из цепочки ── */
+  /** Узел, за которым тянется это соединение (пока его держат рукой/мышью). */
+  orb?: GraphNode;
+  /** Точка крепления к узлу: отстаёт от него — линия видимо «вялая». */
+  rab?: { x: number; y: number; z: number };
+  /** Сколько секунд соединение тянется за вырванным узлом. */
+  rabT?: number;
+  /** 0..1 — соединение затянулось в орб: линия схлопнулась и гаснет. */
+  absorb?: number;
+  /** Итоговая прозрачность линии в этом кадре (для отрисовки и тестов). */
+  alpha?: number;
 }
 
 export interface Pulse {
@@ -83,6 +95,19 @@ export interface Pulse {
 }
 
 const NODE_GEOMETRY = new THREE.IcosahedronGeometry(1, 2);
+
+/**
+ * Резинка выдёргиваемого узла.
+ *
+ * Соединение не «приклеено» к узлу намертво: его точка крепления догоняет узел вяло
+ * (LINK_LAG_PULL), поэтому при выдёргивании линия заметно отстаёт и тянется. Через
+ * LINK_ABSORB_START секунд линия начинает затягиваться в орб и за LINK_ABSORB_TIME
+ * схлопывается в него, а на отпускании так же плавно выкатывается обратно.
+ */
+const LINK_LAG_PULL = 2.2;
+const LINK_ABSORB_START = 1.5;
+const LINK_ABSORB_TIME = 0.8;
+const LINK_RELEASE_RATE = 2.4;
 const MAX_PULSES = 900;
 
 export class ForceGraph {
@@ -357,6 +382,56 @@ export class ForceGraph {
     }
   }
 
+  /**
+   * Поведение соединения при выдёргивании его узла:
+   *  • пока узел держат — точка крепления вяло догоняет его (линия отстаёт и тянется);
+   *  • через LINK_ABSORB_START секунд линия затягивается в орб (absorb → 1);
+   *  • после отпускания — плавно выкатывается обратно к своему узлу.
+   */
+  #updateRubberBand(link: GraphLink, dragged: GraphNode | null, dt: number): void {
+    const attached = dragged && (link.source === dragged || link.target === dragged);
+
+    if (attached && dragged) {
+      const nodeX = dragged.x ?? 0;
+      const nodeY = dragged.y ?? 0;
+      const nodeZ = dragged.z ?? 0;
+      if (link.orb !== dragged || !link.rab) {
+        // Только что вырвали: точка крепления стартует из узла и остаётся за ним.
+        link.orb = dragged;
+        link.rab = { x: nodeX, y: nodeY, z: nodeZ };
+        link.rabT = 0;
+      }
+      link.rabT = (link.rabT ?? 0) + dt;
+      const pull = Math.min(1, dt * LINK_LAG_PULL);
+      link.rab.x += (nodeX - link.rab.x) * pull;
+      link.rab.y += (nodeY - link.rab.y) * pull;
+      link.rab.z += (nodeZ - link.rab.z) * pull;
+
+      link.absorb =
+        link.rabT > LINK_ABSORB_START
+          ? Math.min(1, (link.rabT - LINK_ABSORB_START) / LINK_ABSORB_TIME)
+          : 0;
+      return;
+    }
+
+    // Узел отпустили: то, что успело затянуться, выкатывается обратно из орба.
+    if ((link.absorb ?? 0) > 0) {
+      link.absorb = Math.max(0, (link.absorb ?? 0) - dt * LINK_RELEASE_RATE);
+      if (link.absorb === 0) {
+        link.orb = undefined;
+        link.rab = undefined;
+        link.rabT = undefined;
+      }
+      return;
+    }
+
+    if (link.orb) {
+      link.orb = undefined;
+      link.rab = undefined;
+      link.rabT = undefined;
+    }
+  }
+
   /** Шаг физики + обновление геометрии. Вызывается каждый кадр. */
   update(dt: number, time: number, selectedId: string | null): void {
     // Физику гоняем только пока система «горячая» — иначе CPU простаивает.
@@ -422,17 +497,63 @@ export class ForceGraph {
     this.#nodeMesh.instanceMatrix.needsUpdate = true;
     if (this.#nodeMesh.instanceColor) this.#nodeMesh.instanceColor.needsUpdate = true;
 
-    // Рёбра: позиции узлов + «остывание».
+    // Рёбра: позиции узлов, «остывание» и резинка выдёргиваемого узла.
     let linkIndex = 0;
     for (const link of this.links) {
       link.heat = Math.max(link.heat - dt * 0.35, 0.12);
       const offset = linkIndex * 6;
-      this.#linkPositions[offset] = link.source.x ?? 0;
-      this.#linkPositions[offset + 1] = link.source.y ?? 0;
-      this.#linkPositions[offset + 2] = link.source.z ?? 0;
-      this.#linkPositions[offset + 3] = link.target.x ?? 0;
-      this.#linkPositions[offset + 4] = link.target.y ?? 0;
-      this.#linkPositions[offset + 5] = link.target.z ?? 0;
+
+      let ax = link.source.x ?? 0;
+      let ay = link.source.y ?? 0;
+      let az = link.source.z ?? 0;
+      let bx = link.target.x ?? 0;
+      let by = link.target.y ?? 0;
+      let bz = link.target.z ?? 0;
+
+      this.#updateRubberBand(link, this.#dragged, dt);
+      const anchor = link.orb;
+      if (anchor) {
+        const nodeX = anchor.x ?? 0;
+        const nodeY = anchor.y ?? 0;
+        const nodeZ = anchor.z ?? 0;
+        const absorb = link.absorb ?? 0;
+        const attachment = link.rab ?? { x: nodeX, y: nodeY, z: nodeZ };
+        // Точка крепления: сначала отстаёт (вялая), потом втягивается в узел.
+        const attachX = attachment.x + (nodeX - attachment.x) * absorb;
+        const attachY = attachment.y + (nodeY - attachment.y) * absorb;
+        const attachZ = attachment.z + (nodeZ - attachment.z) * absorb;
+
+        if (link.source === anchor) {
+          ax = attachX;
+          ay = attachY;
+          az = attachZ;
+        } else {
+          bx = attachX;
+          by = attachY;
+          bz = attachZ;
+        }
+
+        // «Затягивается в орб»: дальний конец линии тоже уходит в узел, линия схлопывается.
+        if (absorb > 0) {
+          if (link.source === anchor) {
+            bx += (nodeX - bx) * absorb;
+            by += (nodeY - by) * absorb;
+            bz += (nodeZ - bz) * absorb;
+          } else {
+            ax += (nodeX - ax) * absorb;
+            ay += (nodeY - ay) * absorb;
+            az += (nodeZ - az) * absorb;
+          }
+        }
+      }
+
+      link.alpha = 1 - (link.absorb ?? 0);
+      this.#linkPositions[offset] = ax;
+      this.#linkPositions[offset + 1] = ay;
+      this.#linkPositions[offset + 2] = az;
+      this.#linkPositions[offset + 3] = bx;
+      this.#linkPositions[offset + 4] = by;
+      this.#linkPositions[offset + 5] = bz;
 
       const color = this.#tempColor;
       if (link.kind === 'local-process') {
@@ -440,6 +561,8 @@ export class ForceGraph {
       } else {
         heatPalette(link.heat, color).multiplyScalar(0.3 + link.heat * 0.9);
       }
+      // Затягивание в орб гасит линию: она буквально «уходит внутрь» узла.
+      color.multiplyScalar(link.alpha);
       this.#linkColors[offset] = color.r;
       this.#linkColors[offset + 1] = color.g;
       this.#linkColors[offset + 2] = color.b;

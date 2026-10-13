@@ -163,6 +163,7 @@ export class GestureService {
       statusText: statusLabel(this.#status),
       handCount: state.handsCount,
       hint: hintForStatus(this.#status),
+      pinchText: pinchText(state, this.#status),
     });
   }
 
@@ -324,6 +325,18 @@ export class GestureService {
  * Что делать, если жестов не видно: вторая строка на плашке состояния.
  * Тексты намеренно короткие — плашка должна читаться с одного взгляда.
  */
+/**
+ * Строка про щипок: текущее отношение и порог срабатывания. Когда рука в кадре и щипок
+ * не срабатывает — сразу видно, насколько не хватает (например «щипок 0.71 → нужно < 0.56»),
+ * и это можно прислать мне цифрой.
+ */
+export function pinchText(state: GestureState, status: SourceStatus): string {
+  if (status.phase !== 'running' || state.handsCount === 0) return '';
+  const { ratio, enter, active } = state.pinch;
+  if (active) return `щипок ✓ (${ratio.toFixed(2)} < ${enter.toFixed(2)})`;
+  return `щипок ${ratio.toFixed(2)} → нужно < ${enter.toFixed(2)}`;
+}
+
 export function hintForStatus(status: SourceStatus): string {
   if (status.phase === 'error') return 'настройки (S) → «Демо-рука» покажет жесты без камеры';
   if (status.phase === 'running' && status.message?.includes('демо')) {

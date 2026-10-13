@@ -64,7 +64,7 @@ export class GestureController {
     handsCount: 0,
     pose: 'none',
     cursor: { active: false, ndcX: 0, ndcY: 0, screenX: 0, screenY: 0 },
-    pinch: { strength: 0, active: false, progress: 0 },
+    pinch: { strength: 0, active: false, progress: 0, ratio: 1, enter: PINCH_ENTER, exit: PINCH_EXIT },
     grabbed: false,
     roll: 0,
     twoHand: { active: false, scale: 1, twist: 0, centerX: 0, centerY: 0 },
@@ -89,6 +89,13 @@ export class GestureController {
   #rawCursor = { x: 0, y: 0 };
   #rawSecondary = { x: 0, y: 0 };
   #rawPinchRatio = 1;
+  /**
+   * «Раскрытое» значение отношения для этой руки. Калибровка: если рука далеко от камеры или
+   * наклонена, то и щипок, и ладонь дают большие отношения — фиксированный порог 0.42 тогда
+   * не срабатывает вовсе. Пороги считаем относительно baseline: щипок — это провал
+   * относительно раскрытой кисти, а не абсолютное число.
+   */
+  #pinchBaseline = 0;
   #rawSecondaryPinchRatio = 1;
   #rawScale: number | null = null;
   #rawRoll = 0;
@@ -207,6 +214,7 @@ export class GestureController {
       this.state.pinch.active = false;
       this.state.pinch.strength = 0;
       this.state.pinch.progress = 0;
+      this.state.pinch.ratio = 1;
       this.state.grabbed = false;
       this.state.twoHand.active = false;
       this.state.twoHand.twist = 0;
@@ -244,12 +252,34 @@ export class GestureController {
       this.state.secondaryCursor.active = false;
     }
 
-    // ── Щипок с гистерезисом.
+    // ── Щипок с гистерезисом и калибровкой по руке.
     const ratio = this.#pinchFilter.push(this.#rawPinchRatio, dt);
+
+    // Калибровка по руке. Ориентир — раскрытая кисть, поэтому baseline обновляем только
+    // когда щипка нет: иначе долгий щипок «принял» бы себя за норму. Вверх тянемся быстро,
+    // вниз — заметно (рука переехала ближе к камере), но не мгновенно.
+    if (!this.state.pinch.active) {
+      if (this.#pinchBaseline <= 0) {
+        this.#pinchBaseline = ratio;
+      } else if (ratio > this.#pinchBaseline) {
+        this.#pinchBaseline += (ratio - this.#pinchBaseline) * Math.min(1, dt * 5);
+      } else {
+        this.#pinchBaseline = Math.max(ratio, this.#pinchBaseline - dt * 0.35);
+      }
+    }
+    const baseline = Math.max(this.#pinchBaseline, 0.35);
+    // Порог входа — доля от «раскрытого» значения: щипок это провал относительно ладони.
+    const enter = Math.min(0.72, Math.max(0.3, baseline * 0.62));
+    // Выход всегда ниже раскрытой кисти (0.85 от ориентира) — иначе щипок «залипает».
+    const exit = Math.min(0.97, Math.max(enter * 1.2, baseline * 0.85));
+    this.state.pinch.enter = enter;
+    this.state.pinch.exit = exit;
+
     const wasPinching = this.state.pinch.active;
-    if (!wasPinching && ratio < PINCH_ENTER) this.state.pinch.active = true;
-    else if (wasPinching && ratio > PINCH_EXIT) this.state.pinch.active = false;
-    this.state.pinch.strength = Math.min(1, Math.max(0, (PINCH_EXIT - ratio) / (PINCH_EXIT - PINCH_ENTER * 0.6)));
+    if (!wasPinching && ratio < enter) this.state.pinch.active = true;
+    else if (wasPinching && ratio > exit) this.state.pinch.active = false;
+    this.state.pinch.ratio = ratio;
+    this.state.pinch.strength = Math.min(1, Math.max(0, (exit - ratio) / (exit - enter * 0.6)));
     this.state.secondaryPinch = this.#rawSecondaryPinchRatio < PINCH_ENTER;
 
     // ── Поворот кисти (им вращается «вырванный» объект).

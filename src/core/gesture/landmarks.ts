@@ -54,20 +54,37 @@ export function distance2d(a: Point, b: Point): number {
 }
 
 /**
- * Масштаб кисти: расстояние «запястье → основание среднего пальца».
- * Все отношения считаем к нему, поэтому жесты одинаково работают и у монитора,
- * и в двух метрах от камеры.
+ * Масштаб кисти. Раньше это было только «запястье → основание среднего пальца», но при
+ * наклоне кисти этот отрезок укорачивается (перспектива), а вместе с ним растут все
+ * отношения — и щипок переставал определяться. Поэтому берём максимум из нескольких
+ * промеров: самый длинный из них меньше всего страдает от наклона и расстояния до камеры.
  */
 export function handScale(landmarks: Landmark[]): number {
   if (landmarks.length < 21) return 1e-4;
-  const scale = distance2d(landmarks[WRIST], landmarks[MIDDLE_MCP]);
+  const probes = [
+    distance2d(landmarks[WRIST], landmarks[MIDDLE_MCP]),
+    distance2d(landmarks[WRIST], landmarks[INDEX_MCP]),
+    distance2d(landmarks[WRIST], landmarks[RING_MCP]),
+    distance2d(landmarks[INDEX_MCP], landmarks[PINKY_MCP]),
+    distance2d(landmarks[WRIST], landmarks[PINKY_MCP]),
+  ];
+  const scale = Math.max(...probes);
   return scale > 1e-4 ? scale : 1e-4;
 }
 
-/** Отношение расстояния «большой—указательный» к размеру кисти. Меньше — ближе к щипку. */
+/**
+ * Отношение «расстояние кончика большого до кончика указательного» к размеру кисти.
+ * Меньше — ближе к щипку. Считаем в 3D (z — относительная глубина): пальцы могут сойтись
+ * «в глубину», и по одной проекции это выглядит как зазор.
+ */
 export function pinchRatio(landmarks: Landmark[]): number {
   if (landmarks.length < 21) return 1;
-  return distance2d(landmarks[THUMB_TIP], landmarks[INDEX_TIP]) / handScale(landmarks);
+  const thumb = landmarks[THUMB_TIP];
+  const index = landmarks[INDEX_TIP];
+  // z у MediaPipe в той же нормировке, но шумнее — учитываем с весом 0.7.
+  const dz = (thumb.z - index.z) * 0.7;
+  const distance = Math.hypot(thumb.x - index.x, thumb.y - index.y, dz);
+  return distance / handScale(landmarks);
 }
 
 /** Центр ладони — среднее запястья и четырёх оснований пальцев. */
@@ -183,6 +200,8 @@ export function makeSyntheticHand(options: {
   pinch?: number;
   /** Большой палец поднят вверх (жест «класс»). */
   thumbsUp?: boolean;
+  /** Во сколько раз шире развести большой палец (проверка адаптивного порога щипка). */
+  thumbSpread?: number;
 }): Landmark[] {
   const { centerX, centerY, size } = options;
   const rotation = options.rotation ?? 0;
@@ -238,7 +257,7 @@ export function makeSyntheticHand(options: {
     return landmarks;
   }
 
-  const thumbSpread = (1 - pinch) * 0.55;
+  const thumbSpread = (1 - pinch) * 0.55 * (options.thumbSpread ?? 1);
   landmarks[1] = place(-0.55, 0.35);
   landmarks[2] = place(-0.75 - thumbSpread * 0.3, 0.15 - thumbSpread * 0.2);
   landmarks[THUMB_IP] = place(-0.85 - thumbSpread * 0.5, -0.05 - thumbSpread * 0.45);

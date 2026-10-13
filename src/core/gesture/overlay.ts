@@ -23,6 +23,8 @@ export interface OverlayOptions {
   handCount: number;
   /** Диагностика: причина ошибки распознавания (если есть). */
   hint?: string;
+  /** Живая настройка щипка: «щипок 0.83 → порог 0.56» — видно, почему жест не срабатывает. */
+  pinchText?: string;
 }
 
 export class GestureOverlay {
@@ -367,7 +369,7 @@ export class GestureOverlay {
    */
   #drawBadge(ctx: CanvasRenderingContext2D, state: GestureState, options: OverlayOptions): void {
     const title = `${options.statusText} · рук: ${options.handCount}`;
-    const hint = options.hint ?? '';
+    const hint = options.pinchText ?? options.hint ?? '';
     const padding = 10;
     const lineHeight = 15;
     const rows = hint ? 2 : 1;

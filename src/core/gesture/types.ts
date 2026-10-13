@@ -87,7 +87,17 @@ export interface GestureState {
   pose: HandPose;
   cursor: CursorState;
   /** Щипок: strength 0..1, active — с гистерезисом, progress — заполнение кольца удержания. */
-  pinch: { strength: number; active: boolean; progress: number };
+  pinch: {
+    strength: number;
+    active: boolean;
+    progress: number;
+    /** Текущее отношение «кончики пальцев / размер кисти» (видно в диагностике). */
+    ratio: number;
+    /** Порог срабатывания с учётом калибровки по этой руке. */
+    enter: number;
+    /** Порог отпускания (гистерезис). */
+    exit: number;
+  };
   /** Сцена сообщает, что «взяла» объект (тогда курсор рисует захват). */
   grabbed: boolean;
   /** Две руки: зум и поворот сцены. */

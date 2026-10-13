@@ -30,6 +30,7 @@ import { DemoHandSource } from '../src/core/gesture/demoHand';
 import { loadMediaPipe } from '../src/core/gesture/mediapipe';
 import { PointerHub } from '../src/core/interaction/pointer';
 import { economyRate } from '../src/core/gesture/rate';
+import { pinchText } from '../src/core/gesture';
 import { ForceGraph } from '../src/scenes/network/graph';
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -264,6 +265,102 @@ async function main(): Promise<void> {
   const moved = inspectGraph.nodes.some((node) => node.kind !== 'local' && node.fx !== null && node.fx !== undefined);
   check(!moved, 'после возврата ни один узел не закреплён');
   inspectGraph.dispose();
+
+  console.log('Сеть: соединения выдёргиваются вместе с узлом (резинка)');
+  const rubberGraph = new ForceGraph();
+  rubberGraph.sync(inspectConnections);
+  for (let frame = 0; frame < 120; frame++) rubberGraph.update(1 / 60, frame / 60, null);
+
+  const centre = rubberGraph.nodes.find((node) => node.kind === 'process')!;
+  const attached = rubberGraph.links.filter((link) => link.source === centre || link.target === centre);
+  check(attached.length > 0, `у узла «${centre.label}» есть соединения (${attached.length})`);
+
+  rubberGraph.beginDrag(centre);
+  rubberGraph.setBoost(centre, 1);
+  for (let frame = 0; frame < 20; frame++) rubberGraph.update(1 / 60, frame / 60, null);
+
+  // Уводим узел далеко: точка крепления соединений должна остаться позади (вялая резинка).
+  const away = { x: 60, y: 40, z: 30 };
+  rubberGraph.moveDragged(away as unknown as Parameters<typeof rubberGraph.moveDragged>[0]);
+  rubberGraph.update(1 / 60, 0.5, null);
+  const lag = Math.hypot(
+    (attached[0].rab?.x ?? away.x) - away.x,
+    (attached[0].rab?.y ?? away.y) - away.y,
+    (attached[0].rab?.z ?? away.z) - away.z,
+  );
+  check(lag > 5, `соединения отстают от узла — линия тянется (отставание ${lag.toFixed(1)})`);
+
+  // Через ~2 секунды линия затягивается в орб: схлопывается и гаснет.
+  for (let frame = 0; frame < 140; frame++) rubberGraph.update(1 / 60, 0.6 + frame / 60, null);
+  check(
+    attached.every((link) => (link.absorb ?? 0) > 0.9),
+    `соединения затянулись в орб (absorb ${(attached[0].absorb ?? 0).toFixed(2)})`,
+  );
+  check(
+    attached.every((link) => (link.alpha ?? 1) < 0.1),
+    `линии в орбе погасли (alpha ${(attached[0].alpha ?? 1).toFixed(2)})`,
+  );
+
+  // Отпускаем: линии выкатываются обратно к своим узлам.
+  rubberGraph.setBoost(centre, 0);
+  rubberGraph.endDrag(true);
+  for (let frame = 0; frame < 60; frame++) rubberGraph.update(1 / 60, 3.5 + frame / 60, null);
+  check(
+    attached.every((link) => (link.absorb ?? 0) === 0 && (link.alpha ?? 0) === 1),
+    'после отпускания соединения вернулись (линии снова видны)',
+  );
+  check(attached[0].orb === undefined, 'состояние резинки сброшено');
+  rubberGraph.dispose();
+
+  console.log('Жесты: калибровка щипка под конкретную руку');
+  // «Далёкая или шумная» рука: раскрытая кисть даёт отношение ~1.0, а неглубокий щипок — 0.46.
+  // Фиксированный порог 0.42 такой щипок не ловил вовсе — отсюда «щипок не робит». Калибровка
+  // считает порог относительно раскрытой кисти этой конкретной руки.
+  const farOpen = makeSyntheticHand({ centerX: 0.5, centerY: 0.5, size: 0.1, openness: 1, thumbSpread: 2.2 });
+  const farHalfPinch = makeSyntheticHand({ centerX: 0.5, centerY: 0.5, size: 0.1, pinch: 0.4, thumbSpread: 2.2 });
+  const shallowRatio = pinchRatio(farHalfPinch);
+  check(
+    shallowRatio > PINCH_ENTER,
+    `неглубокий щипок даёт ${shallowRatio.toFixed(2)} — фиксированный порог ${PINCH_ENTER} его не поймал бы`,
+  );
+
+  const calibrated = new GestureController({
+    mirror: false,
+    sensitivity: 1.2,
+    smoothing: 0.5,
+    pauseGesture: false,
+    swipes: false,
+    fistReset: false,
+  });
+  let calClock = 0;
+  const calRun = (landmarks: Landmark[], frames: number): void => {
+    for (let i = 0; i < frames; i++) {
+      calClock += step;
+      if (i % 2 === 0) {
+        calibrated.push({ hands: [{ landmarks, handedness: 'Right', score: 0.95 }], timestampMs: calClock * 1000, inferenceMs: 3 });
+      }
+      calibrated.update(step);
+    }
+  };
+
+  calRun(farOpen, 60);
+  check(!calibrated.state.pinch.active, 'раскрытая рука не считается щипком');
+  check(
+    calibrated.state.pinch.enter > PINCH_ENTER,
+    `порог подстроился под руку: ${calibrated.state.pinch.enter.toFixed(2)} > ${PINCH_ENTER}`,
+  );
+
+  calRun(farHalfPinch, 40);
+  check(calibrated.state.pinch.active, `неглубокий щипок распознан (отношение ${shallowRatio.toFixed(2)})`);
+
+  calRun(farOpen, 40);
+  check(!calibrated.state.pinch.active, 'после раскрытия пальцев щипок отпускается');
+
+  const pinchInfo = pinchText(calibrated.state, { phase: 'running' });
+  check(
+    pinchInfo.includes('щипок') && /\d\.\d\d/.test(pinchInfo),
+    `диагностика щипка показывает цифры: «${pinchInfo}»`,
+  );
 
   console.log('Жесты: поведение по умолчанию (без случайных пауз и перелистывания)');
   const quiet = new GestureController({
