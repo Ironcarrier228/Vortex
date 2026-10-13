@@ -280,8 +280,8 @@ async function main(): Promise<void> {
   rubberGraph.setBoost(centre, 1);
   for (let frame = 0; frame < 20; frame++) rubberGraph.update(1 / 60, frame / 60, null);
 
-  // Уводим узел далеко: точка крепления соединений остаётся позади (вялая резинка).
-  const away = new THREE.Vector3(60, 40, 30);
+  // Уводим узел далеко от его текущего места: точка крепления остаётся позади (вялая резинка).
+  const away = new THREE.Vector3((centre.x ?? 0) + 60, (centre.y ?? 0) + 40, (centre.z ?? 0) + 30);
   rubberGraph.moveDragged(away);
   rubberGraph.update(1 / 60, 0.5, null);
   const lag = Math.hypot(
@@ -428,6 +428,126 @@ async function main(): Promise<void> {
   );
   holeGraph.endDrag(true, twoHands[1]);
   check(holeGraph.grabbedCount === 0, 'обе руки свободны');
+
+  // ── Передача подключений: с одного орба на другой и наоборот ──
+  console.log('Сеть: подключения передаются орб → орб (и наоборот)');
+  const wire = new ForceGraph();
+  wire.sync(inspectConnections);
+  for (let frame = 0; frame < 120; frame++) wire.update(1 / 60, frame / 60, null);
+
+  const donor = wire.nodes.find((node) => node.kind === 'process' && node.label === 'svchost')!;
+  const receiver = wire.nodes.find((node) => node.kind === 'process' && node.label === 'node')!;
+  const donorLinks = wire.links.filter((link) => link.source === donor || link.target === donor);
+  const receiverLinks = wire.links.filter((link) => link.source === receiver || link.target === receiver);
+  check(donorLinks.length === 7 && receiverLinks.length === 7, `у обоих процессов по 7 связей`);
+
+  const handOff = wire.rewire(donor, receiver);
+  check(Boolean(handOff) && handOff?.moved === 6, `подключения перешли другому орбу (${handOff?.moved})`);
+  check(
+    wire.links.filter((link) => link.kind === 'process-remote' && (link.source === donor || link.target === donor)).length === 0,
+    'у отдавшего орба не осталось подключений',
+  );
+  check(
+    wire.links.filter((link) => link.kind === 'process-remote' && (link.source === receiver || link.target === receiver)).length === 12,
+    'у принявшего орба стало вдвое больше подключений',
+  );
+  check(
+    wire.links.filter((link) => link.kind === 'local-process' && (link.source === donor || link.target === donor)).length === 1,
+    'связь «машина ↔ процесс» осталась у процесса',
+  );
+  check(wire.holderOf(donor) === receiver, 'граф знает, кто держит подключения отдавшего');
+  check(wire.holderOf(receiver) === undefined, 'принявший владеет подключениями сам');
+  check(wire.connectionsOf(donor).length === 0 && wire.connectionsOf(receiver).length === 12, 'панель видит линии по графу');
+
+  // Снимок сети не возвращает подключения обратно: владелец запомнен.
+  for (let frame = 0; frame < 40; frame++) wire.update(1 / 60, 3 + frame / 60, null);
+  wire.sync(inspectConnections);
+  check(
+    wire.links.filter((link) => link.kind === 'process-remote' && (link.source === donor || link.target === donor)).length === 0,
+    'новый снимок сети не отменяет передачу',
+  );
+  check(wire.nodes.includes(donor), 'отдавший орб остался в сцене');
+
+  // «Обратно»: подключения возвращаются прежнему орбу.
+  check(wire.undoRewire(), 'передача отменяется');
+  check(
+    wire.links.filter((link) => link.kind === 'process-remote' && (link.source === donor || link.target === donor)).length === 6,
+    'подключения вернулись к прежнему орбу',
+  );
+  check(
+    wire.links.filter((link) => link.kind === 'process-remote' && (link.source === receiver || link.target === receiver)).length === 6,
+    'и у второго орба снова свои шесть',
+  );
+  check(wire.holderOf(donor) === undefined && wire.rewireCount === 0, 'владельцы вернулись в исходное');
+
+  // Та же передача, но в другую сторону: перетащили приёмник на отдающего.
+  const back = wire.rewire(receiver, donor);
+  check(Boolean(back) && back?.moved === 6, `подключения node перешли svchost (${back?.moved})`);
+  check(wire.holderOf(receiver) === donor && wire.rewireCount === 1, 'направление обратное — владелец другой орб');
+  wire.sync(inspectConnections);
+  check(
+    wire.links.filter((link) => link.kind === 'process-remote' && (link.source === receiver || link.target === receiver)).length === 0,
+    'обратная передача тоже держится снимком сети',
+  );
+
+  // Дыра и передача: у орба в дыре подключения забирает сосед, а не теряются.
+  check(wire.undoRewire(), 'вторая передача тоже отменяется');
+  wire.unpinAll();
+  wire.sync(inspectConnections);
+  check(wire.links.filter((link) => link.source === donor || link.target === donor).length === 7, 'после «Вернуть узлы» всё как было');
+
+  // Орбы разных типов подключениями не меняются, «эту машину» не выбирают.
+  const host = wire.nodes.find((node) => node.kind === 'remote')!;
+  const machine = wire.nodes.find((node) => node.kind === 'local')!;
+  check(!wire.canRewire(donor, host), 'процесс и хост подключениями не меняются');
+  check(!wire.canRewire(donor, machine), '«эту машину» в приёмники не берём');
+  check(!wire.canRewire(donor, donor), 'сам с собой орб не меняется');
+  check(wire.canRewire(donor, receiver), 'два процесса — можно');
+  check(wire.rewire(donor, host) === null, 'передача между разными типами отменяется');
+  check(wire.rewire(machine, donor) === null, 'у «этой машины» подключения забрать нельзя');
+
+  // Хост ↔ хост: подключения хоста переезжают другому хосту — тоже работает.
+  const hostWire = new ForceGraph();
+  hostWire.sync(inspectConnections);
+  for (let frame = 0; frame < 120; frame++) hostWire.update(1 / 60, frame / 60, null);
+  const hostA = hostWire.nodes.find((node) => node.kind === 'remote' && node.label === 'host-0')!;
+  const hostB = hostWire.nodes.find((node) => node.kind === 'remote' && node.label === 'host-1')!;
+  const hostMove = hostWire.rewire(hostA, hostB);
+  check(Boolean(hostMove) && hostMove?.moved === 1, `хост тоже может отдать подключение хосту (${hostMove?.moved})`);
+  check(hostWire.holderOf(hostA) === hostB, 'хост знает, кто держит его подключение');
+  hostWire.undoRewire();
+  check(hostWire.holderOf(hostA) === undefined, 'и получает его обратно по «Обратно»');
+  hostWire.dispose();
+
+  // Чёрная дыра: по ней видно, куда бросить орб (проверяем на камере).
+  const camera = new THREE.PerspectiveCamera(52, 1, 0.5, 900);
+  camera.position.set(0, 0, 96);
+  camera.lookAt(0, 0, 0);
+  camera.updateMatrixWorld();
+  const holeView = new ForceGraph();
+  holeView.sync(inspectConnections);
+  const throwMe = holeView.nodes.find((node) => node.kind === 'remote')!;
+  holeView.throwNode(throwMe, new THREE.Vector3(0, 0, -60));
+  for (let frame = 0; frame < 600 && holeView.nodes.includes(throwMe); frame++) {
+    holeView.update(1 / 60, frame / 60, null, camera);
+  }
+  const holeCentre = new THREE.Vector3()
+    .copy(holeView.hole.object.position)
+    .applyMatrix4(holeView.object.matrixWorld)
+    .project(camera);
+  check(
+    holeView.hitHole(camera, holeCentre.x, holeCentre.y),
+    'видимую дыру можно навести и бросить в неё орб (попадание по центру)',
+  );
+  check(!holeView.hitHole(camera, holeCentre.x + 0.6, holeCentre.y), 'мимо дыры — промах');
+  holeView.dispose();
+
+  // Приёмник подсвечивается — сцена видит, куда перейдут подключения.
+  wire.setDropTarget(receiver);
+  check(wire.dropTarget === receiver, 'орб-приёмник подсвечен');
+  wire.setDropTarget(null);
+  check(wire.dropTarget === null, 'подсветка снимается');
+  wire.dispose();
 
   // ── Масштаб сцены: «сложить всю сцену в ладонь» — это не зум камеры ──
   const sample = holeGraph.nodes[0];

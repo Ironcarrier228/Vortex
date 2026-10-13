@@ -193,6 +193,18 @@ export class ForceGraph {
   #substitutes = new Map<string, string>();
   /** Что лежит в чёрной дыре: узел и связи, которые надо вернуть вместе с ним. */
   #dumps = new Map<string, { node: GraphNode; connections: NetConnection[] }>();
+  /**
+   * Журнал ручных передач подключений: кто у кого забрал связи и какие именно —
+   * чтобы кнопка «Обратно» вернула всё ровно как было (и в ту, и в другую сторону).
+   */
+  #rewireLog: {
+    fromId: string;
+    toId: string;
+    links: string[];
+    owners: [string, string | undefined][];
+  }[] = [];
+  /** Орб, который примет подключения, если отпустить здесь (подсвечивается). */
+  #dropTarget: GraphNode | null = null;
   /** Общий масштаб сцены: 1 — обычный, меньше — «сложили всю сцену в ладонь». */
   #scale = 1;
   #anchor = new THREE.Vector3();
@@ -458,9 +470,12 @@ export class ForceGraph {
   /** Куда на самом деле ведут связи узла: цепочка подстановок «вырван → сосед». */
   #resolve(id: string): string {
     let current = id;
+    const seen = new Set<string>([id]);
     for (let hop = 0; hop < 8; hop++) {
       const next = this.#substitutes.get(current);
-      if (!next || next === current) break;
+      // Цикл (A → B → A) — это не ошибка данных, но разворачивать его нельзя.
+      if (!next || next === current || seen.has(next)) break;
+      seen.add(next);
       current = next;
     }
     return current;
@@ -559,6 +574,7 @@ export class ForceGraph {
   /** Перелёт одного конца связи к соседу (визуально: линия «перепрыгивает» на соседний орб). */
   #transfer(link: GraphLink, from: GraphNode, to: GraphNode): void {
     if (link.cutT !== undefined) return;
+    if (link.source !== from && link.target !== from) return;
     const side: 'source' | 'target' = link.source === from ? 'source' : 'target';
     link.flow = { x: from.x ?? 0, y: from.y ?? 0, z: from.z ?? 0 };
     link.flowT = 0;
@@ -707,7 +723,8 @@ export class ForceGraph {
       const pulse = 1 + Math.sin(time * (2.4 + node.intensity * 3) + i) * 0.08 * node.intensity;
       const base =
         node.kind === 'local' ? 5.4 : node.kind === 'process' ? 2.1 + Math.min(node.degree, 12) * 0.12 : 1.35;
-      const inspect = 1 + (node.boost ?? 0) * (node.kind === 'remote' ? 2.6 : 1.9);
+      const hint = node === this.#dropTarget ? 0.5 : 0;
+      const inspect = 1 + ((node.boost ?? 0) + hint) * (node.kind === 'remote' ? 2.6 : 1.9);
       const eaten = 1 - Math.min(1, node.devour ?? 0);
       const size = base * (0.85 + node.intensity * 0.55) * pulse * inspect * eaten;
       scale.setScalar(size);
@@ -729,6 +746,8 @@ export class ForceGraph {
       } else {
         color.multiplyScalar(0.65 + node.intensity * 0.6);
       }
+      // Приёмник подключений подсвечиваем белым: сразу видно, куда они перейдут.
+      if (node === this.#dropTarget) color.lerp(WHITE, 0.45);
       // Поглощаемый узел гаснет вместе с размером.
       if (eaten < 1) color.multiplyScalar(0.3 + eaten * 0.7);
       this.#nodeMesh.setColorAt(i, color);
@@ -1031,7 +1050,9 @@ export class ForceGraph {
    * и точку на радиус вбок от него — так размер на экране получается честным.
    */
   hitHole(camera: THREE.PerspectiveCamera, ndcX: number, ndcY: number, slack = 0.02): boolean {
-    if (!this.#hole.alive || this.#dumps.size === 0) return false;
+    // Видимую дыру можно и взять рукой, и просто бросить в неё орб — поэтому проверяем
+    // только то, что она вообще есть в сцене (пустая дыра ничего не отдаст, см. grabHole).
+    if (!this.#hole.alive) return false;
     this.object.updateMatrixWorld();
     const centre = new THREE.Vector3()
       .copy(this.#hole.object.position)
@@ -1330,6 +1351,123 @@ export class ForceGraph {
     node.spin = spin;
   }
 
+  /* ─────────────── Передача подключений: орб → орб (руками) ─────────────── */
+
+  /**
+   * Может ли `from` передать подключения `to`: орбы одного типа (процесс ↔ процесс,
+   * хост ↔ хост), не «эта машина», не поглощённые и не занятые другой рукой.
+   */
+  canRewire(from: GraphNode | null, to: GraphNode | null): boolean {
+    if (!from || !to || from === to) return false;
+    if (from.kind !== to.kind || from.kind === 'local') return false;
+    if (from.devour !== undefined || to.devour !== undefined) return false;
+    return !this.#grabbed.includes(to);
+  }
+
+  /** Орб, который примет подключения, если отпустить указатель здесь. */
+  get dropTarget(): GraphNode | null {
+    return this.#dropTarget;
+  }
+
+  /** Подсветить орб-приёмник (или снять подсветку): видно, куда перейдут подключения. */
+  setDropTarget(node: GraphNode | null): void {
+    if (this.#dropTarget === node) return;
+    if (this.#dropTarget && this.#dropTarget.boostTarget !== undefined) {
+      this.#dropTarget.boostTarget = this.#dropTarget === this.#grabbed[0] ? 1 : 0;
+    }
+    this.#dropTarget = node;
+  }
+
+  /** Сколько ручных передач подключений сейчас активно (для панели сцены). */
+  get rewireCount(): number {
+    return this.#rewireLog.length;
+  }
+
+  /** Подключения узла по линиям графа: после передач это не то же, что соединения процесса. */
+  connectionsOf(node: GraphNode): NetConnection[] {
+    const out: NetConnection[] = [];
+    for (const link of this.links) {
+      if (link.kind !== 'process-remote') continue;
+      if (link.source !== node && link.target !== node) continue;
+      out.push(link.connection);
+    }
+    return out;
+  }
+
+  /** Кто сейчас держит подключения узла (если он их отдал руками) — для подсказок. */
+  holderOf(node: GraphNode): GraphNode | undefined {
+    const owner = this.#resolve(node.id);
+    if (owner === node.id) return undefined;
+    return this.#byId.get(owner);
+  }
+
+  /**
+   * Отдать подключения одного орба другому: «соединения этого процесса теперь идут в тот».
+   *
+   * Каждая линия вырванного орба перелетает к соседнему орбу (`#transfer`), а сама подстановка
+   * «кто теперь владелец» живёт в `#substitutes`, поэтому очередной снимок сети не вернёт
+   * связи обратно. Работает в обе стороны: перетащите A на B — подключения уйдут к B,
+   * перетащите B на A — уйдут к A. Связь «машина ↔ процесс» остаётся у процесса: он сам
+   * никуда не делся, переехали только его подключения.
+   */
+  rewire(from: GraphNode, to: GraphNode): { moved: number; connections: NetConnection[] } | null {
+    // Меняться подключениями могут орбы одного типа (процесс ↔ процесс, хост ↔ хост)
+    // и не «эта машина»: смешивать типы — значит получить бессмысленную сцену.
+    if (!this.canRewire(from, to)) return null;
+    const movedIds: string[] = [];
+    const connections: NetConnection[] = [];
+    for (const link of [...this.links]) {
+      if (link.source !== from && link.target !== from) continue;
+      if (link.kind !== 'process-remote') continue;
+      const far = link.source === from ? link.target : link.source;
+      // Уже подключён к этому орбу — второй такой же линии не нужно.
+      if (far === to) continue;
+      this.#transfer(link, from, to);
+      movedIds.push(link.id);
+      connections.push(link.connection);
+    }
+    if (movedIds.length === 0) return null;
+
+    // Владельцем меняем не только сам орб, но и всех, чьи подключения на нём висели
+    // (например, после передачи соседу): «всё, что на этом орбе, теперь на том».
+    const owners: [string, string | undefined][] = [];
+    for (const key of new Set<string>([from.id, ...this.#substitutes.keys()])) {
+      if (this.#resolve(key) !== from.id) continue;
+      owners.push([key, this.#substitutes.get(key)]);
+      if (key === to.id) this.#substitutes.delete(key);
+      else this.#substitutes.set(key, to.id);
+    }
+    this.#rewireLog.push({ fromId: from.id, toId: to.id, links: movedIds, owners });
+    this.#refreshLinks();
+    return { moved: movedIds.length, connections };
+  }
+
+  /**
+   * «Обратно»: вернуть подключения прежнему орбу — и линии, и подстановку. Работает и для
+   * обратного направления: если вы перетащили B на A, отмена вернёт подключения к B.
+   */
+  undoRewire(): boolean {
+    const record = this.#rewireLog.pop();
+    if (!record) return false;
+    const from = this.#byId.get(record.fromId);
+    const to = this.#byId.get(record.toId);
+    for (const [key, before] of record.owners) {
+      if (before === undefined) this.#substitutes.delete(key);
+      else this.#substitutes.set(key, before);
+    }
+
+    if (from && to) {
+      for (const id of record.links) {
+        const link = this.links.find((candidate) => candidate.id === id);
+        if (!link) continue;
+        if (link.source === to) this.#transfer(link, to, from);
+        else if (link.target === to) this.#transfer(link, to, from);
+      }
+    }
+    this.#refreshLinks();
+    return true;
+  }
+
   /**
    * Вернуть всё в исходное: снять закрепления, вернуть разорванные связи и оживить
    * проглоченные узлы (кнопка «Вернуть узлы», жест «кулак»). Сцена после этого делает
@@ -1347,6 +1485,8 @@ export class ForceGraph {
       node.devour = undefined;
     }
     this.#grabbed.length = 0;
+    this.#dropTarget = null;
+    this.#rewireLog.length = 0;
     this.#devouring.length = 0;
     this.#cutDone.length = 0;
     for (const shell of this.#shells) shell.visible = false;

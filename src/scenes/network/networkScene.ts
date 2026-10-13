@@ -127,6 +127,7 @@ export class NetworkScene implements SceneModule {
     ndc: new THREE.Vector2(),
   };
   #tempVec = new THREE.Vector3();
+  #tempVec2 = new THREE.Vector3();
   #rayNdc = new THREE.Vector2();
   /** Общий масштаб сцены: руками сводим/разводим — сцена сжимается целиком. */
   #sceneScale = 1;
@@ -640,6 +641,7 @@ export class NetworkScene implements SceneModule {
     this.#updateDrag(dt);
     this.#updateSecondaryHand(dt);
     this.#updateSceneScale(dt);
+    this.#updateDropTarget();
 
     if (this.#globeActive) {
       this.#updateGlobe(dt, time);
@@ -685,6 +687,20 @@ export class NetworkScene implements SceneModule {
     this.#hovered = node;
     this.#dragCandidate = node;
     this.#dragStartNdc.copy(this.#ndc);
+  }
+
+  /**
+   * Пока орб в руке — ищем орб под указателем: если отпустить здесь, подключения перейдут
+   * ему. Приёмник подсвечивается белым, поэтому намерение видно до отпускания.
+   */
+  #updateDropTarget(): void {
+    const node = this.#graph.dragged;
+    if (!this.#dragging || !node || this.#globeActive) {
+      if (this.#graph.dropTarget) this.#graph.setDropTarget(null);
+      return;
+    }
+    const found = this.#graph.hitTest(this.camera, this.#ndc.x, this.#ndc.y, this.#grabRadius);
+    this.#graph.setDropTarget(this.#graph.canRewire(node, found) ? found : null);
   }
 
   /** Радиус захвата: рукой целимся крупнее, мышью — точнее. */
@@ -849,14 +865,52 @@ export class NetworkScene implements SceneModule {
     this.#orbit.setSuspended(false);
     const node = this.#graph.dragged;
     const speed = this.#dragVelocity.length();
+    const target = this.#graph.dropTarget;
+    this.#graph.setDropTarget(null);
+
+    // Отпустили орб НА другом орбе — передаём ему подключения (в любую сторону: что
+    // перетащили, то и отдаёт). Приёмник подсвечивался всё время, пока вы целились.
+    const rewired =
+      node && !this.#globeActive && this.#graph.canRewire(node, target) && target
+        ? this.#graph.rewire(node, target)
+        : null;
+
+    // Отпустили орб НА чёрной дыре — она забирает его сразу, без разгона: навёл и отпустил.
+    let thrown = false;
+    if (!rewired && node && !target && !this.#globeActive && this.#graph.hitHole(this.camera, this.#ndc.x, this.#ndc.y, 0.06)) {
+      const toHole = this.#tempVec2
+        .copy(this.#graph.hole.object.position)
+        .applyMatrix4(this.#graph.object.matrixWorld)
+        .sub(this.#graph.nodeWorld(node, this.#tempVec));
+      const distance = Math.max(1e-3, toHole.length());
+      toHole.multiplyScalar((THROW_SPEED_MIN * 1.6) / distance);
+      thrown = this.#graph.throwNode(node, toHole);
+    }
     // Рывок кистью (или мыши) = бросок: орб выкинули в чёрную дыру.
-    const thrown = node && speed > THROW_SPEED_MIN ? this.#graph.throwNode(node, this.#dragVelocity) : false;
+    if (!rewired && !thrown && node && speed > THROW_SPEED_MIN) {
+      thrown = this.#graph.throwNode(node, this.#dragVelocity);
+    }
     if (node) this.#graph.setBoost(node, 0);
     this.#graph.endDrag(true, node);
     this.#dragVelocity.set(0, 0, 0);
     this.#hasDragPoint = false;
     this.#ctx.gesture.setGrabbed(false);
     this.#ctx.gesture.setTether(null);
+
+    if (rewired && node && target) {
+      if (!this.#globeActive) this.#graph.sync(this.#connections);
+      this.#selected = target;
+      this.#updateDiagnostics();
+      this.#renderPanel();
+      this.#ctx.toast(
+        'info',
+        `«${node.label}» отдал свои подключения (${rewired.moved}) орбу «${target.label}» · ` +
+          'перетащите другой орб на этот — будет наоборот',
+        { action: { label: 'Обратно', run: () => this.#undoRewire() } },
+      );
+      return;
+    }
+
     if (thrown && node) {
       this.#ctx.toast(
         'info',
@@ -872,6 +926,15 @@ export class NetworkScene implements SceneModule {
         `Узел «${node.label}» вырван из цепочки и оставлен · запросов: ${requests} · панель слева показывает их`,
       );
     }
+  }
+
+  /** «Обратно»: подключения возвращаются прежнему орбу — и линии, и владелец в графе. */
+  #undoRewire(): void {
+    if (!this.#graph.undoRewire()) return;
+    if (!this.#globeActive) this.#graph.sync(this.#connections);
+    this.#updateDiagnostics();
+    this.#renderPanel();
+    this.#ctx.toast('info', 'Подключения вернулись к прежнему орбу');
   }
 
   /**
@@ -961,6 +1024,32 @@ export class NetworkScene implements SceneModule {
     this.#second.node = null;
     if (!node) return;
     const speed = this.#second.velocity.length();
+
+    // Вторая рука тоже умеет передавать подключения: отпустили орб на другом орбе.
+    if (!quiet) {
+      const target = this.#graph.hitTest(this.camera, this.#second.ndc.x, this.#second.ndc.y, GRAB_RADIUS_HAND);
+      const usable = this.#graph.canRewire(node, target) ? target : null;
+      if (usable) {
+        const moved = this.#graph.rewire(node, usable);
+        if (moved) {
+          this.#graph.setBoost(node, 0);
+          this.#graph.endDrag(true, node);
+          this.#second.velocity.set(0, 0, 0);
+          this.#second.hasLast = false;
+          if (!this.#dragging) this.#ctx.gesture.setGrabbed(false);
+          if (!this.#globeActive) this.#graph.sync(this.#connections);
+          this.#selected = usable;
+          this.#updateDiagnostics();
+          this.#renderPanel();
+          this.#ctx.toast(
+            'info',
+            `Вторая рука: «${node.label}» отдал подключения (${moved.moved}) орбу «${usable.label}»`,
+            { action: { label: 'Обратно', run: () => this.#undoRewire() } },
+          );
+          return;
+        }
+      }
+    }
     const thrown = !quiet && speed > THROW_SPEED_MIN ? this.#graph.throwNode(node, this.#second.velocity) : false;
     this.#graph.setBoost(node, 0);
     this.#graph.endDrag(true, node);
@@ -1217,6 +1306,8 @@ export class NetworkScene implements SceneModule {
     const scale = Math.round(this.#graph.globalScale * 100);
     const parts: string[] = [];
     if (handed) parts.push(`связи у соседей: ${handed}`);
+    const rewired = this.#graph.rewireCount;
+    if (rewired) parts.push(`передано руками: ${rewired}`);
     if (inHole) parts.push(`в чёрной дыре: ${inHole}`);
     if (scale !== 100) parts.push(`сцена ${scale}%`);
     const extra = parts.length ? ` · ${parts.join(' · ')}` : '';
@@ -1235,7 +1326,9 @@ export class NetworkScene implements SceneModule {
           (node.kind === 'process' && connection.process === node.process) ||
           (node.kind === 'remote' && connection.remote.ip === node.ip),
       );
-      const requests = this.#requestsOf(node);
+      // Подключения узла берём из графа: после ручных передач это не то же самое, что
+      // соединения процесса в системе — и панель обязана показывать именно линии сцены.
+      const requests = this.#graph.connectionsOf(node);
       const protocols = new Map<string, number>();
       for (const connection of requests) {
         protocols.set(connection.protocol, (protocols.get(connection.protocol) ?? 0) + 1);
@@ -1247,11 +1340,24 @@ export class NetworkScene implements SceneModule {
       const pinned = node.fx !== null && node.fx !== undefined;
       body.innerHTML = `<div class="hud-label">${escapeHtml(node.kind === 'process' ? 'процесс' : node.kind === 'remote' ? 'удалённый хост' : 'машина')}</div>
         <div style="font-size:13px;margin:4px 0 6px">${escapeHtml(node.label)}</div>
-        <div class="hud-field-value">запросов: ${requests.length}${breakdown ? ` · ${escapeHtml(breakdown)}` : ''}</div>
+        <div class="hud-field-value">подключений в сцене: ${requests.length}${breakdown ? ` · ${escapeHtml(breakdown)}` : ''}</div>
+        ${
+          (() => {
+            const holder = this.#graph.holderOf(node);
+            if (holder) {
+              return `<div class="hud-label" style="margin-top:6px">подключения переданы орбу «${escapeHtml(holder.label)}» · перетащите орб на этот, чтобы вернуть</div>`;
+            }
+            const system = this.#requestsOf(node).length;
+            if (holder === undefined && system > 0 && requests.length === 0) {
+              return `<div class="hud-label" style="margin-top:6px">линий в сцене нет · в системе соединений: ${system}</div>`;
+            }
+            return '';
+          })()
+        }
         ${
           pinned
-            ? '<div class="hud-label" style="margin-top:6px">вырван из цепочки и оставлен · «Вернуть узлы» возвращает всё</div>'
-            : '<div class="hud-label" style="margin-top:6px">щипок/зажать — вырвать узел и покрутить кистью; рывок при отпускании — выкинуть в чёрную дыру</div>'
+            ? '<div class="hud-label" style="margin-top:6px">орб в руке/оставлен · отпустите его НА другом орбе — подключения перейдут тому; «Вернуть узлы» возвращает всё</div>'
+            : '<div class="hud-label" style="margin-top:6px">щипок — вырвать; перетащите на другой орб и отпустите — подключения перейдут ему; рывок при отпускании — в чёрную дыру</div>'
         }`;
       const list = document.createElement('div');
       list.className = 'hud-group';
