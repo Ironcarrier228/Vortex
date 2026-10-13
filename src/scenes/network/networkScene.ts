@@ -1756,6 +1756,8 @@ export class NetworkScene implements SceneModule {
     if (handed) parts.push(`связи у соседей: ${handed}`);
     const rewired = this.#graph.rewireCount;
     if (rewired) parts.push(`передано руками: ${rewired}`);
+    const merged = this.#graph.mergeCount;
+    if (merged) parts.push(`слито орбов: ${merged}`);
     if (this.#pointMode) {
       const what = this.#pointMode === 'merge' ? 'слияние' : 'передача';
       parts.push(this.#transferSource ? `${what}: «${this.#transferSource.label}»` : `режим ${what}`);

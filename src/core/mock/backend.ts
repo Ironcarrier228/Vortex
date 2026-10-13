@@ -33,7 +33,8 @@ function installSystem(): void {
   // это честный эквивалент, и вызов из сцены остаётся единым для обеих сред.
   mockCommand('app_quit', () => {
     console.info('[mock] app_quit: перезапускаю страницу (в приложении Tauri здесь закрылось бы окно)');
-    window.setTimeout(() => window.location.reload(), 400);
+    // Пауза, чтобы в браузере успел прочитаться чёрный экран «дыра поглотила всё».
+    window.setTimeout(() => window.location.reload(), 1600);
     return null;
   });
 
