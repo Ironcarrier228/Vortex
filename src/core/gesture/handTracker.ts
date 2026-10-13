@@ -16,19 +16,13 @@
  */
 
 import { loadMediaPipe, type MpFileset, type MpLandmarker } from './mediapipe';
+import { MODEL_LOCAL, MODEL_SOURCES, looksLikeTaskFile } from './modelFile';
 import type { HandFrame, HandObservation, HandSource, SourceStatus } from './types';
 
 const WASM_LOCAL = '/mediapipe/wasm';
 /** Запасной источник WASM. Версия должна совпадать с зависимостью @mediapipe/tasks-vision. */
 const WASM_CDN = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@1.1.0/wasm';
 
-const MODEL_LOCAL = '/models/hand_landmarker.task';
-/** Официальный адрес модели MediaPipe (Apache-2.0). Нужен один раз — потом кэшируется. */
-const MODEL_CDN =
-  'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task';
-
-/** Минимальный осмысленный размер .task — защита от HTML-заглушек вместо файла. */
-const MODEL_MIN_BYTES = 100_000;
 
 export class CameraHandSource implements HandSource {
   readonly kind = 'camera' as const;
@@ -147,26 +141,38 @@ export class CameraHandSource implements HandSource {
     }
   }
 
-  /** Модель: локальный файл (офлайн) → CDN. Проверяем ZIP-сигнатуру. */
+  /**
+   * Модель: локальный файл (офлайн) → официальный CDN → зеркала на CDN npm.
+   * Формат проверяем терпимо (см. `modelFile.ts`): у настоящей модели перед ZIP-сигнатурой
+   * стоят два нулевых байта, поэтому строгая проверка «PK» в начале отвергала валидный файл.
+   */
   async #loadModelBytes(): Promise<Uint8Array> {
-    const sources = [MODEL_LOCAL, MODEL_CDN];
-    for (const url of sources) {
+    const failures: string[] = [];
+    for (const url of MODEL_SOURCES) {
       try {
         const response = await fetch(url);
-        if (!response.ok) continue;
-        const bytes = new Uint8Array(await response.arrayBuffer());
-        const isZip = bytes.length > 4 && bytes[0] === 0x50 && bytes[1] === 0x4b; // "PK"
-        if (bytes.length < MODEL_MIN_BYTES || !isZip) {
-          console.warn(`[gesture] ${url} не похож на модель hand_landmarker.task`);
+        if (!response.ok) {
+          failures.push(`${url}: HTTP ${response.status}`);
           continue;
         }
+        const bytes = new Uint8Array(await response.arrayBuffer());
+        if (!looksLikeTaskFile(bytes)) {
+          console.warn(`[gesture] ${url} не похож на модель hand_landmarker.task (${bytes.length} байт)`);
+          failures.push(`${url}: не контейнер .task (${bytes.length} байт)`);
+          continue;
+        }
+        this.status = { ...this.status, modelSource: url === MODEL_LOCAL ? 'локальный файл' : url };
         return bytes;
       } catch (err) {
         console.warn(`[gesture] модель недоступна по ${url}:`, err);
+        failures.push(`${url}: ${err instanceof Error ? err.message : String(err)}`);
       }
     }
+
     throw new Error(
-      'модель hand_landmarker.task не найдена: положите файл в public/models/ (npm run fetch:models)',
+      `модель hand_landmarker.task не найдена (проверено ${failures.length} адресов). ` +
+        'Положите файл в public/models/ командой `npm run fetch:models` — ' +
+        'или включите «Демо-руку», она работает без модели и камеры',
     );
   }
 

@@ -24,6 +24,7 @@ import { installMockBackend } from '../src/core/mock/backend';
 import { AudioBus } from '../src/core/audio/bus';
 import { invoke, listen } from '../src/core/transport';
 import { PINCH_ENTER, PINCH_EXIT, classifyPose, makeSyntheticHand, pinchRatio } from '../src/core/gesture/landmarks';
+import { MODEL_SOURCES, looksLikeTaskFile } from '../src/core/gesture/modelFile';
 import { GestureController } from '../src/core/gesture/gestureController';
 import { DemoHandSource } from '../src/core/gesture/demoHand';
 import { loadMediaPipe } from '../src/core/gesture/mediapipe';
@@ -293,6 +294,38 @@ async function main(): Promise<void> {
       dom.Vision = undefined;
     }
   }
+
+  console.log('Жесты: распознавание контейнера модели (.task)');
+  // Настоящая модель начинается двумя нулевыми байтами перед ZIP-сигнатурой:
+  //   00 00 50 4b 03 04 …
+  // Строгая проверка «PK в первых двух байтах» отвергала валидный файл — теперь заголовок
+  // ищется в первых 64 байтах, плюс проверяется запись конца каталога в хвосте.
+  const modelOnDisk = join(process.cwd(), 'public', 'models', 'hand_landmarker.task');
+  if (existsSync(modelOnDisk)) {
+    const bytes = new Uint8Array(readFileSync(modelOnDisk));
+    check(looksLikeTaskFile(bytes), `скачанная модель принимается (${(bytes.length / 1024 ** 2).toFixed(1)} МБ)`);
+    check(
+      bytes[0] === 0 && bytes[1] === 0 && bytes[2] === 0x50 && bytes[3] === 0x4b,
+      'подтверждено: у модели два нулевых байта перед ZIP-заголовком',
+    );
+  } else {
+    console.log('  • пропущено: public/models/hand_landmarker.task не скачана (npm run fetch:models)');
+  }
+
+  const fakeTask = new Uint8Array(200_000);
+  fakeTask.set([0x00, 0x00, 0x50, 0x4b, 0x03, 0x04]);
+  fakeTask.set([0x50, 0x4b, 0x05, 0x06], fakeTask.length - 4);
+  check(looksLikeTaskFile(fakeTask), 'файл с заголовком ZIP и концом каталога принимается');
+  check(!looksLikeTaskFile(new Uint8Array(200_000)), 'нули без ZIP-заголовка отвергаются');
+  check(!looksLikeTaskFile(fakeTask.subarray(0, 50_000)), 'слишком маленький файл отвергается');
+  const htmlStub = new TextEncoder().encode(
+    '<!doctype html><html><body>index.html</body></html>' + ' '.repeat(200_000),
+  );
+  check(!looksLikeTaskFile(htmlStub), 'HTML-заглушка dev-сервера отвергается');
+  check(
+    MODEL_SOURCES[0] === '/models/hand_landmarker.task' && MODEL_SOURCES.length >= 3,
+    `локальный путь — первый источник, зеркал не меньше двух (${MODEL_SOURCES.length})`,
+  );
 
   console.log(failures === 0 ? '\nВсе проверки пройдены ✅' : `\nПровалено проверок: ${failures} ❌`);
   process.exit(failures === 0 ? 0 : 1);

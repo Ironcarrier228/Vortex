@@ -21,6 +21,8 @@ export interface OverlayOptions {
   mapToNdc: (x: number, y: number) => { x: number; y: number };
   statusText: string;
   handCount: number;
+  /** Диагностика: причина ошибки распознавания (если есть). */
+  hint?: string;
 }
 
 export class GestureOverlay {
@@ -358,24 +360,44 @@ export class GestureOverlay {
   }
 
   /** Компактная строка статуса рядом с превью: модель, FPS, руки. */
+  /**
+   * Плашка состояния: всегда видно, что происходит («нет камеры», «модель не скачалась»,
+   * «жесты · 30 FPS · GPU»). Место — правый нижний угол, чтобы не налезать на панель сцены.
+   * Когда рука найдена, плашка становится едва заметной: скелет и так всё показывает.
+   */
   #drawBadge(ctx: CanvasRenderingContext2D, state: GestureState, options: OverlayOptions): void {
-    const text = `${options.statusText} · рук: ${options.handCount}`;
-    ctx.save();
-    ctx.font = '11px var(--font-mono, monospace)';
-    const textWidth = ctx.measureText(text).width;
-    const x = 16;
-    const y = options.showPreview ? window.innerHeight - 60 - 244 : window.innerHeight - 60 - 30;
+    const title = `${options.statusText} · рук: ${options.handCount}`;
+    const hint = options.hint ?? '';
+    const padding = 10;
+    const lineHeight = 15;
+    const rows = hint ? 2 : 1;
 
-    ctx.fillStyle = 'rgba(10, 16, 28, 0.68)';
-    ctx.strokeStyle = 'rgba(120, 200, 255, 0.28)';
+    ctx.save();
+    ctx.font = '11px ui-monospace, Consolas, "Courier New", monospace';
+    const width = Math.max(ctx.measureText(title).width, hint ? ctx.measureText(hint).width : 0) + padding * 2;
+    const height = rows * lineHeight + padding * 1.2;
+    const x = Math.max(16, window.innerWidth - width - 16);
+    const y = window.innerHeight - height - 16;
+
+    // Рука в кадре и всё хорошо — не мешаем смотреть: плашка почти прозрачная.
+    const quiet = state.cursor.active && !hint;
+    ctx.globalAlpha = quiet ? 0.35 : 1;
+
+    ctx.fillStyle = 'rgba(10, 16, 28, 0.78)';
+    ctx.strokeStyle = hint ? 'rgba(248, 113, 113, 0.55)' : 'rgba(120, 200, 255, 0.28)';
     ctx.beginPath();
-    ctx.roundRect(x, y, textWidth + 20, 24, 8);
+    ctx.roundRect(x, y, width, height, 8);
     ctx.fill();
     ctx.stroke();
 
-    ctx.fillStyle = state.cursor.active ? '#9be9ff' : 'rgba(160, 180, 200, 0.8)';
     ctx.textAlign = 'left';
-    ctx.fillText(text, x + 10, y + 16);
+    ctx.fillStyle = state.cursor.active ? '#9be9ff' : 'rgba(160, 180, 200, 0.9)';
+    ctx.fillText(title, x + padding, y + padding + 6);
+
+    if (hint) {
+      ctx.fillStyle = 'rgba(248, 180, 180, 0.95)';
+      ctx.fillText(hint, x + padding, y + padding + 6 + lineHeight);
+    }
     ctx.restore();
   }
 

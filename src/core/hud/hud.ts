@@ -639,14 +639,32 @@ export class Hud {
 
   /* ─────────────────────────── Тосты ─────────────────────────── */
 
-  toast(kind: 'info' | 'warn' | 'error', message: string): void {
+  toast(
+    kind: 'info' | 'warn' | 'error',
+    message: string,
+    options?: { action?: { label: string; run: () => void } },
+  ): void {
     const node = el('div', `hud-toast ${kind}`, escapeHtml(message));
+    if (options?.action) {
+      const button = el('button', 'hud-btn hud-toast-action', escapeHtml(options.action.label));
+      button.addEventListener('click', () => {
+        options.action?.run();
+        node.remove();
+      });
+      node.appendChild(button);
+    }
     this.#toasts.appendChild(node);
-    const lifetime = kind === 'error' ? 7000 : 4200;
+    // Ошибки живут дольше: у них есть кнопка «что делать».
+    const lifetime = kind === 'error' ? 9000 : 4200;
     setTimeout(() => {
       node.classList.add('fade');
       setTimeout(() => node.remove(), 420);
     }, lifetime);
+  }
+
+  /** Открыть панель настроек (для тостов с кнопкой действия). */
+  openSettings(): void {
+    this.#settingsWrap.style.display = 'block';
   }
 
   /* ─────────────────────────── Режимы сцены ─────────────────────────── */

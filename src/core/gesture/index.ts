@@ -39,6 +39,9 @@ export class GestureService {
   #enabled = false;
   #paused = false;
   #starting = false;
+  /** Камера не далась (нет устройства, запрет доступа) — показываем демо-руку. */
+  #autoDemo = false;
+  #demoReason = '';
 
   #eventListeners = new Set<(name: GestureName | 'hand-lost') => void>();
   #statusListeners = new Set<(status: SourceStatus, state: GestureState) => void>();
@@ -156,6 +159,7 @@ export class GestureService {
       mapToNdc: (x, y) => this.controller.mapToNdc(x, y),
       statusText: statusLabel(this.#status),
       handCount: state.handsCount,
+      hint: hintForStatus(this.#status),
     });
   }
 
@@ -180,7 +184,10 @@ export class GestureService {
 
     this.#frameUnsub = source.onFrame((frame) => this.#onFrame(frame));
     this.#statusUnsub = source.onStatus((status) => {
-      this.#status = status;
+      this.#status = this.#autoDemo
+        ? { ...status, message: status.message ? `${status.message} · демо: ${this.#demoReason}` : `демо: ${this.#demoReason}` }
+        : status;
+      if (this.#autoDemo) this.#status.phase = 'running';
       this.#overlay.video = source.kind === 'camera' ? (source as CameraHandSource).videoElement : null;
       this.#emitStatus(status);
     });
@@ -188,11 +195,38 @@ export class GestureService {
 
     try {
       await source.start();
+      this.#demoReason = '';
+      this.#autoDemo = false;
     } catch (err) {
-      this.#emitStatus({ phase: 'error', message: err instanceof Error ? err.message : String(err) });
+      const message = err instanceof Error ? err.message : String(err);
+
+      // Камера/модель не дались — не оставляем пользователя с пустым экраном и непонятной
+      // ошибкой: переключаемся на синтетическую руку и честно говорим, почему.
+      if (!prefs.handDemo) {
+        this.#autoDemo = true;
+        this.#demoReason = message;
+        console.warn(`[gesture] камера недоступна (${message}) — включаю демо-руку`);
+        this.#emitStatus({ phase: 'running', message: `демо: ${message}`, delegate: 'CPU' });
+        await this.#startDemoSource();
+      } else {
+        this.#emitStatus({ phase: 'error', message });
+      }
     } finally {
       this.#starting = false;
     }
+  }
+
+  /** Переключение на синтетическую руку (та же логика жестов, но без камеры и модели). */
+  async #startDemoSource(): Promise<void> {
+    const source = new DemoHandSource();
+    this.#source = source;
+    this.#frameUnsub = source.onFrame((frame) => this.#onFrame(frame));
+    this.#statusUnsub = source.onStatus((status) => {
+      this.#status = { ...status, message: `демо-рука: ${this.#demoReason}` };
+      this.#emitStatus(this.#status);
+    });
+    this.#overlay.setVisible(this.#prefs.get().handShowSkeleton || this.#prefs.get().handShowPreview);
+    await source.start();
   }
 
   #teardownSource(): void {
@@ -225,8 +259,12 @@ export class GestureService {
       this.#overlay.setVisible(prefs.handShowSkeleton || prefs.handShowPreview);
     }
 
-    // Смена источника (камера ↔ демо) требует перезапуска.
-    if (changed.includes('handDemo') && this.#enabled) void this.#startSource();
+    // Смена источника (камера ↔ демо) требует перезапуска и снимает авто-подмену.
+    if (changed.includes('handDemo') && this.#enabled) {
+      this.#autoDemo = false;
+      this.#demoReason = '';
+      void this.#startSource();
+    }
 
     if (changed.includes('handEnabled')) void this.setEnabled(prefs.handEnabled);
   }
@@ -257,6 +295,19 @@ export class GestureService {
   };
 }
 
+/**
+ * Что делать, если жестов не видно: вторая строка на плашке состояния.
+ * Тексты намеренно короткие — плашка должна читаться с одного взгляда.
+ */
+export function hintForStatus(status: SourceStatus): string {
+  if (status.phase === 'error') return 'настройки (S) → «Демо-рука» покажет жесты без камеры';
+  if (status.phase === 'running' && status.message?.includes('демо')) {
+    return 'демо-рука: синтетический сценарий, камера не используется';
+  }
+  if (status.phase === 'running') return 'держите кисть в 40–80 см от камеры';
+  return '';
+}
+
 export function statusLabel(status: SourceStatus): string {
   switch (status.phase) {
     case 'off':
@@ -268,7 +319,9 @@ export function statusLabel(status: SourceStatus): string {
     case 'starting-camera':
       return status.message ?? 'включаю камеру…';
     case 'running':
-      return `жесты · ${Math.round(status.fps ?? 0)} FPS · ${status.delegate ?? 'CPU'}`;
+      return `жесты · ${Math.round(status.fps ?? 0)} FPS · ${status.delegate ?? 'CPU'}${
+        status.modelSource ? ` · модель: ${status.modelSource}` : ''
+      }`;
     case 'error':
       return `ошибка: ${status.message ?? 'неизвестно'}`;
     default:

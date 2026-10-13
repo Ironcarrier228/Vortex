@@ -47,6 +47,8 @@ export type SourcePhase =
   | 'error';
 
 export interface SourceStatus {
+  /** Откуда взялась модель (для диагностики в HUD). */
+  modelSource?: string;
   phase: SourcePhase;
   message?: string;
   /// Реальный FPS распознавания.

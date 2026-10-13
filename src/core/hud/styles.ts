@@ -304,6 +304,14 @@ export const HUD_CSS = /* css */ `
 .hud-settings .hud-field + .hud-field { margin-top: 10px; }
 .hud-settings label.hud-field-head { cursor: pointer; }
 
+/* Кнопка действия внутри тоста (например, «Открыть настройки» при ошибке жестов). */
+.hud-toast-action {
+  margin-top: 6px;
+  height: 24px;
+  font-size: 10.5px;
+  pointer-events: auto;
+}
+
 /* Состояние распознавания рук в нижней строке HUD. */
 .hud-hands-ok {
   color: var(--cyan, #22d3ee);

@@ -156,11 +156,20 @@ class App implements AppHost {
     });
 
     this.gesture.onStatus((status, state) => {
+      // «Ручной» демо-режим (преф или ?hand=demo) — это не ошибка: так и просили.
+      const manualDemo = this.prefs.get().handDemo;
       if (status.phase === 'running' && this.#lastGestureStatus !== 'running') {
-        this.#hud.toast('info', 'Руки распознаются: щипок — взять узел, ладонь — пауза, свайп — смена сцены');
+        this.#hud.toast(
+          'info',
+          manualDemo
+            ? 'Демо-рука включена: кисть синтетическая, камера не используется'
+            : 'Руки распознаются: щипок — взять узел, ладонь — пауза, свайп — смена сцены',
+        );
       }
       if (status.phase === 'error' && this.#lastGestureStatus !== 'error') {
-        this.#hud.toast('error', `Жесты недоступны: ${status.message ?? 'ошибка'}`);
+        this.#hud.toast('error', `Жесты недоступны: ${status.message ?? 'ошибка'}`, {
+          action: { label: 'Открыть настройки', run: () => this.#hud.openSettings() },
+        });
       }
       this.#lastGestureStatus = status.phase;
       void state;
@@ -240,9 +249,15 @@ class App implements AppHost {
   toggleHands(): void {
     const enabled = !this.prefs.get().handEnabled;
     this.prefs.set({ handEnabled: enabled });
+    if (!enabled) {
+      this.#hud.toast('info', 'Управление жестами выключено');
+      return;
+    }
     this.#hud.toast(
-      enabled ? 'info' : 'info',
-      enabled ? 'Включаю распознавание рук — разрешите доступ к камере' : 'Управление жестами выключено',
+      'info',
+      this.prefs.get().handDemo
+        ? 'Демо-рука включена: синтетическая кисть, камера не нужна'
+        : 'Включаю распознавание рук — разрешите доступ к камере, если Windows спросит',
     );
   }
 
