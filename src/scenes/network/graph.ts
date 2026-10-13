@@ -132,7 +132,7 @@ const MAX_PULSES = 900;
  * получается затягивание по спирали, которое не может «промахнуться». Через
  * THROW_PATIENCE секунд дыра тянет заметно сильнее: эффект обязан завершиться.
  */
-const HOLE_RADIUS: Record<NodeKind, number> = { local: 7, process: 6.5, remote: 4.6 };
+const HOLE_RADIUS: Record<NodeKind, number> = { local: 8, process: 5.4, remote: 4.2 };
 const THROW_TURN = 2.6;
 const THROW_PATIENCE = 2.4;
 /** Сколько узел схлопывается в точку, оказавшись за горизонтом событий (с). */
@@ -851,8 +851,9 @@ export class ForceGraph {
     node.fz = node.z ?? 0;
     node.thrown = { vx: velocity.x, vy: velocity.y, vz: velocity.z };
     node.throwT = 0;
-    // Летящий орб заметно крупнее: видно, что именно он улетает.
-    node.boostTarget = Math.max(node.boostTarget ?? 0, 1.6);
+    // Орб возвращается к обычному размеру: дыра крупнее его, и в этом весь смысл —
+    // видно, как уменьшающийся шарик уходит за горизонт событий.
+    node.boostTarget = 0;
 
     const speed = velocity.length();
     const direction = speed > 1e-3 ? velocity.clone().divideScalar(speed) : new THREE.Vector3(0, 0, -1);
