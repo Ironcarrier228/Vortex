@@ -30,7 +30,7 @@ import { DemoHandSource } from '../src/core/gesture/demoHand';
 import { loadMediaPipe } from '../src/core/gesture/mediapipe';
 import { PointerHub } from '../src/core/interaction/pointer';
 import { economyRate } from '../src/core/gesture/rate';
-import { pinchText } from '../src/core/gesture';
+import { frameInfo, hintForStatus, pinchText } from '../src/core/gesture';
 import * as THREE from 'three';
 import { ForceGraph } from '../src/scenes/network/graph';
 import { existsSync, readFileSync } from 'node:fs';
@@ -267,7 +267,7 @@ async function main(): Promise<void> {
   check(!moved, 'после возврата ни один узел не закреплён');
   inspectGraph.dispose();
 
-  console.log('Сеть: соединения выдёргиваются вместе с узлом (резинка и обрыв)');
+  console.log('Сеть: подключения вырванного орба забирает сосед');
   const rubberGraph = new ForceGraph();
   rubberGraph.sync(inspectConnections);
   for (let frame = 0; frame < 120; frame++) rubberGraph.update(1 / 60, frame / 60, null);
@@ -298,26 +298,45 @@ async function main(): Promise<void> {
   check(attached.every((link) => (link.absorb ?? 0) === 0), 'отпустили рано — линии выкатились обратно');
   check(attached.every((link) => rubberGraph.links.includes(link)), 'связи на месте, пока их не вырвали до конца');
 
-  // Держим долго: линия всосалась в орб и РВЁТСЯ — соединение уходит вместе с узлом.
+  // Держим долго: линия всосалась — подключения орба забирает сосед.
   rubberGraph.beginDrag(centre);
   rubberGraph.setBoost(centre, 1);
   rubberGraph.moveDragged(away);
   for (let frame = 0; frame < 200; frame++) rubberGraph.update(1 / 60, 2 + frame / 60, null);
-  check(rubberGraph.severedCount > 0, `связи вырваны из цепочки (${rubberGraph.severedCount})`);
-  check(attached.every((link) => !rubberGraph.links.includes(link)), 'разорванные линии ушли из графа');
-  check(rubberGraph.nodes.includes(centre), 'сам узел остался: он вырван, но живёт в сцене');
+  check(rubberGraph.takeoverCount > 0, `подключения перешли соседу (наследников: ${rubberGraph.takeoverCount})`);
+  check(
+    attached
+      .filter((link) => link.kind === 'process-remote')
+      .every((link) => link.flowFrom !== undefined),
+    'у перешедших связей виден перелёт к соседу (flowFrom)',
+  );
+  check(
+    rubberGraph.links.every((link) => link.source !== centre && link.target !== centre),
+    'у вырванного орба не осталось ни одной связи',
+  );
+  check(rubberGraph.nodes.includes(centre), 'сам вырванный орб остался в сцене');
+  check(
+    attached.some((link) => rubberGraph.links.includes(link)),
+    'линии не исчезли: их подхватил соседний орб',
+  );
+  check(
+    !rubberGraph.links.some(
+      (link) => link.kind === 'local-process' && (link.source === centre || link.target === centre),
+    ),
+    'связь «машина ↔ процесс» ушла (у соседа такая связь уже есть)',
+  );
 
-  // Новый снимок сети не возвращает разорванные связи — пока не нажали «Вернуть узлы».
+  // Новый снимок сети не возвращает связи обратно вырванному орбу — их владелец сменился.
   rubberGraph.sync(inspectConnections);
   check(
     rubberGraph.links.filter((link) => link.source === centre || link.target === centre).length === 0,
-    'разорванные связи не воссоздаются новым снимком',
+    'связи остаются у соседа и после нового снимка',
   );
   rubberGraph.unpinAll();
   rubberGraph.sync(inspectConnections);
   const restored = rubberGraph.links.filter((link) => link.source === centre || link.target === centre);
-  check(restored.length === attached.length, `«Вернуть узлы» восстановила связи (${restored.length})`);
-  check(rubberGraph.severedCount === 0, 'счётчик разорванных связей сброшен');
+  check(restored.length === attached.length, `«Вернуть узлы» вернула связи орбу (${restored.length})`);
+  check(rubberGraph.takeoverCount === 0, 'подстановки соседей сброшены');
   rubberGraph.dispose();
 
   console.log('Сеть: чёрная дыра — выбросить орб руками');
@@ -348,35 +367,54 @@ async function main(): Promise<void> {
   check(holeDistance() < distanceAtThrow, `орб затягивает: ${distanceAtThrow.toFixed(0)} → ${holeDistance().toFixed(0)}`);
   check(holeGraph.hole.radius > 1, `дыра набрала размер (${holeGraph.hole.radius.toFixed(1)})`);
 
-  // Летим, пока узел не уйдёт за горизонт, и следим за разрывом связей.
-  let cutSeen = false;
   for (let frame = 0; frame < 400 && holeGraph.nodes.includes(orb); frame++) {
     holeGraph.update(1 / 60, 1.5 + frame / 60, null);
-    if (orbLinks.some((link) => link.cut !== undefined)) cutSeen = true;
   }
-  check(cutSeen, 'в момент поглощения связи рвутся — у линии появляется точка обрыва');
   check(!holeGraph.nodes.includes(orb), 'орб проглочен: узел исчез из графа');
   check(holeGraph.devoured === 1, `панель сцены видит поглощение (${holeGraph.devoured})`);
+  check(holeGraph.dumpCount === 1, 'орб лежит в чёрной дыре и может быть вытащен');
+  check(holeGraph.takeoverCount === 1, 'подключение выкинутого орба забрал соседний орб');
   check(
-    orbLinks.every((link) => !holeGraph.links.includes(link)),
-    'связи выкинутого орба ушли вместе с ним',
+    orbLinks.every((link) => link.source !== orb && link.target !== orb),
+    'подключения выкинутого орба больше не висят на нём',
   );
-  for (let frame = 0; frame < 140; frame++) holeGraph.update(1 / 60, 9 + frame / 60, null);
-  check(!holeGraph.hole.alive, 'дыра схлопнулась, когда орб исчез');
+  check(orbLinks.every((link) => holeGraph.links.includes(link)), 'линия не оборвалась: её подхватил сосед');
 
-  holeGraph.sync(inspectConnections);
-  check(!holeGraph.nodes.includes(orb), 'новый снимок сети не возвращает проглоченный орб');
-  holeGraph.unpinAll();
+  // Дыра не исчезает: она оседает и ждёт, когда в неё засунут руку.
+  for (let frame = 0; frame < 200; frame++) holeGraph.update(1 / 60, 9 + frame / 60, null);
+  check(holeGraph.hole.alive && !holeGraph.hole.held, 'дыра осела, но осталась в сцене');
+  check(holeGraph.hole.radius < 3, `осевшая дыра стала маленькой (${holeGraph.hole.radius.toFixed(2)})`);
+
+  // Руку в дыру: она раскрывается и отдаёт орб обратно.
+  check(holeGraph.grabHole(), 'дыру можно взять рукой');
+  check(holeGraph.hole.held, 'взятая дыра раскрылась');
+  const pulledOut = holeGraph.extractOrb();
+  check(Boolean(pulledOut) && pulledOut === orb, `из дыры вылез тот самый орб («${pulledOut?.label}»)`);
+  check(holeGraph.dumpCount === 0 && holeGraph.devoured === 0, 'дыра опустела');
+  for (let frame = 0; frame < 200; frame++) holeGraph.update(1 / 60, 12 + frame / 60, null);
+  check(!holeGraph.hole.alive, 'пустая дыра схлопнулась и исчезла');
   holeGraph.sync(inspectConnections);
   check(
     holeGraph.nodes.some((node) => node.id === orb.id),
-    '«Вернуть узлы» оживила проглоченный орб',
+    'вытащенный орб снова в графе',
   );
-  check(
-    holeGraph.links.filter((link) => link.source.id === orb.id || link.target.id === orb.id).length ===
-      orbLinks.length,
-    'связи вернулись вместе с орбом',
-  );
+  const backLinks = holeGraph.links.filter((link) => link.source === orb || link.target === orb);
+  check(backLinks.length === orbLinks.length, `связи вернулись к вытащенному орбу (${backLinks.length})`);
+
+  // Второй заход: выкинули ещё один орб — и вернули всё разом кнопкой «Вернуть узлы».
+  const second = holeGraph.nodes.find((node) => node.kind === 'remote' && node !== orb)!;
+  holeGraph.throwNode(second, new THREE.Vector3(-80, -30, 20));
+  for (let frame = 0; frame < 600 && holeGraph.nodes.includes(second); frame++) {
+    holeGraph.update(1 / 60, 30 + frame / 60, null);
+  }
+  check(!holeGraph.nodes.includes(second), 'второй орб тоже проглочен');
+  holeGraph.sync(inspectConnections);
+  check(!holeGraph.nodes.includes(second), 'новый снимок сети не возвращает проглоченный орб');
+  holeGraph.unpinAll();
+  holeGraph.sync(inspectConnections);
+  check(holeGraph.nodes.some((node) => node.id === second.id), '«Вернуть узлы» оживила проглоченный орб');
+  for (let frame = 0; frame < 200; frame++) holeGraph.update(1 / 60, 40 + frame / 60, null);
+  check(holeGraph.dumpCount === 0 && !holeGraph.hole.alive, 'после возврата дыра пуста и закрыта');
 
   // Две руки: каждый щипок держит свой орб.
   const twoHands = holeGraph.nodes.filter((node) => node.kind !== 'local').slice(0, 2);
@@ -390,6 +428,32 @@ async function main(): Promise<void> {
   );
   holeGraph.endDrag(true, twoHands[1]);
   check(holeGraph.grabbedCount === 0, 'обе руки свободны');
+
+  // ── Масштаб сцены: «сложить всю сцену в ладонь» — это не зум камеры ──
+  const sample = holeGraph.nodes[0];
+  const worldBefore = holeGraph.nodeWorld(sample).clone();
+  holeGraph.setGlobalScale(0.25);
+  check(Math.abs(holeGraph.globalScale - 0.25) < 1e-6, 'сцена сжалась до 25%');
+  const worldAfter = holeGraph.nodeWorld(sample);
+  check(
+    Math.abs(worldAfter.x - worldBefore.x * 0.25) < 1e-6 && Math.abs(worldAfter.y - worldBefore.y * 0.25) < 1e-6,
+    'масштаб применяется к содержимому сцены (координаты узлов сжались)',
+  );
+  check(holeGraph.collapsed, 'сцена помечена как свёрнутая — можно «уместить в ладони»');
+  const palm = new THREE.Vector3(12, 6, -4);
+  holeGraph.setAnchor(palm);
+  for (let frame = 0; frame < 200; frame++) holeGraph.update(1 / 60, 40 + frame / 60, null);
+  const shifted = holeGraph.nodeWorld(sample);
+  // Физика за это время тоже двигала узлы, поэтому сравниваем с их текущими координатами.
+  check(
+    Math.abs(shifted.x - ((sample.x ?? 0) * holeGraph.globalScale + palm.x)) < 0.6 &&
+      Math.abs(shifted.y - ((sample.y ?? 0) * holeGraph.globalScale + palm.y)) < 0.6,
+    'свёрнутая сцена подъехала к точке ладони (якорь)',
+  );
+  holeGraph.setAnchor(null);
+  holeGraph.setGlobalScale(1);
+  for (let frame = 0; frame < 200; frame++) holeGraph.update(1 / 60, 45 + frame / 60, null);
+  check(Math.abs(holeGraph.nodeWorld(sample).x - (sample.x ?? 0)) < 0.6, 'развёрнутая сцена вернулась в центр');
   holeGraph.dispose();
 
   console.log('Жесты: калибровка щипка под конкретную руку');
@@ -631,6 +695,39 @@ async function main(): Promise<void> {
   check(
     MODEL_SOURCES[0] === '/models/hand_landmarker.task' && MODEL_SOURCES.length >= 3,
     `локальный путь — первый источник, зеркал не меньше двух (${MODEL_SOURCES.length})`,
+  );
+
+  console.log('Жесты: диагностика камеры (почему «рук нет»)');
+  const cameraNotes = frameInfo({
+    phase: 'running',
+    device: 'HD WebCam 640×480',
+    resolution: '640×480',
+    frames: 42,
+    darkness: 96,
+  });
+  check(
+    cameraNotes.includes('640×480') && cameraNotes.includes('кадров 42') && cameraNotes.includes('яркость'),
+    `превью показывает состояние камеры: «${cameraNotes}»`,
+  );
+  check(
+    hintForStatus({ phase: 'running', frames: 0 })?.includes('кадры') === true,
+    'ноль кадров — подсказка про камеру, а не про положение руки',
+  );
+  check(
+    hintForStatus({ phase: 'running', frames: 40, darkness: 5 })?.includes('чёрный') === true,
+    'тёмный кадр — подсказка про свет и объектив',
+  );
+  check(
+    hintForStatus({ phase: 'running', frames: 40, darkness: 120 })?.includes('40–80') === true,
+    'живой кадр без руки — подсказка про расстояние до камеры',
+  );
+  check(
+    hintForStatus({ phase: 'error', message: 'камера занята' })?.includes('Демо-рука') === true,
+    'ошибка камеры — предлагаем демо-руку',
+  );
+  check(
+    hintForStatus({ phase: 'starting-camera' })?.includes('Демо') === true,
+    'пока камера поднимается, подсказка говорит про демо-режим',
   );
 
   console.log('Жесты: экономный режим (общая частота с рендером)');

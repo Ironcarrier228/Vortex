@@ -21,6 +21,8 @@ export interface AppHost {
   toggleFullscreen(): void;
   toggleOutputWindow(): void;
   toggleSettings(): void;
+  /** Камеры для выбора в настройках (метки доступны после выдачи разрешения). */
+  listCameras(): Promise<{ id: string; label: string }[]>;
   info(): {
     os: string;
     elevated: boolean;
@@ -280,6 +282,7 @@ export class Hud {
     inner.appendChild(this.#switchField('Зеркалить движение', 'handMirror'));
     inner.appendChild(this.#switchField('Показывать скелет кисти', 'handShowSkeleton'));
     inner.appendChild(this.#switchField('Превью камеры', 'handShowPreview'));
+    inner.appendChild(this.#cameraField());
     // Свайпы и пауза ладонью выключены по умолчанию (срабатывали случайно) — включаются тут.
     inner.appendChild(this.#switchField('Свайп переключает сцены', 'handSwipeScenes'));
     inner.appendChild(this.#switchField('Пауза открытой ладонью', 'handPauseGesture'));
@@ -290,17 +293,21 @@ export class Hud {
       el(
         'div',
         'hud-label',
-        'Щипок двумя пальцами — вырвать узел из цепочки: узел растёт, соединения выдёргиваются ' +
-          'вместе с ним (резинка тянется вяло ~2 секунды, а затем рвётся: линия с вспышкой ' +
-          'отлетает к дальнему узлу), панель сцены показывает запросы. Поворотом кисти узел ' +
-          'крутится, а на спокойном отпускании он остаётся там, где вы его оставили.\n\n' +
-          'Рывок кистью при отпускании — БРОСОК: перед узлом раскрывается чёрная дыра, затягивает ' +
-          'орб по спирали и поглощает его вместе со связями (вернуть всё — кнопка «Вернуть узлы»).\n\n' +
-          'Щипок в пустоте — взялись за саму сцену: движение вращает и наклоняет граф, поворот кисти ' +
-          'доворачивает его вокруг оси взгляда. Вторая рука щипком берёт второй орб — двумя руками ' +
-          'можно развести два узла, развести руки — масштаб, повернуть кисти — вращение.\n\n' +
-          'Порог щипка подстраивается под руку автоматически — текущее значение и порог видны ' +
-          'в плашке состояния («щипок 0.83 → нужно < 0.62»). Большой палец вверх — действие сцены.',
+        'Щипок двумя пальцами — вырвать орб из цепочки: он растёт, подключения тянутся за ним ' +
+          'вяло (резинка ~2 секунды), а потом их забирает СОСЕДНИЙ орб — линии с перелётом ' +
+          'переходят к нему, цепочка не рушится. На спокойном отпускании орб остаётся там, ' +
+          'где вы его оставили; поворотом кисти он крутится.\n\n' +
+          'Рывок кистью при отпускании — БРОСОК: впереди раскрывается чёрная дыра, затягивает орб ' +
+          'по спирали и поглощает его. Дыра не исчезает: щипните по ней — она раскроется и отдаст ' +
+          'случайный проглоченный орб прямо в руку.\n\n' +
+          'Свести/развести две руки — сложить ВСЮ сцену в ладонь и развернуть обратно (масштаб ' +
+          'содержимого, а не зум камеры): свёрнутая сцена висит между кистями. Поворот кистей — ' +
+          'вращение вида.\n\n' +
+          'Щипок в пустоте — взялись за саму сцену: движение вращает и наклоняет граф. Вторая рука ' +
+          'щипком берёт ВТОРОЙ орб — двумя руками можно развести два узла.\n\n' +
+          'Порог щипка подстраивается под руку автоматически, состояние камеры (разрешение, кадры, ' +
+          'яркость) видно в превью — если рук нет, там сразу понятно почему. Большой палец вверх — ' +
+          'действие сцены.',
       ),
     );
 
@@ -375,6 +382,60 @@ export class Hud {
   }
 
   /** Выпадающий список для строковой настройки. */
+  /**
+   * Выбор камеры + кнопка «проверить камеру». Нужно, потому что у ноутбуков их бывает
+   * несколько (обычная и ИК для Windows Hello), и на «не той» рук в кадре не будет.
+   * Список подтягивается, когда панель открывают: до разрешения метки недоступны.
+   */
+  #cameraField(): HTMLElement {
+    const field = el('div', 'hud-field');
+    const head = el('div', 'hud-field-head');
+    head.appendChild(el('span', 'hud-label', 'Камера'));
+    const select = el('select', 'hud-btn') as HTMLSelectElement;
+    select.style.height = '28px';
+    select.style.pointerEvents = 'auto';
+    select.dataset.role = 'camera';
+
+    const fill = (cameras: { id: string; label: string }[]): void => {
+      const current = this.#prefs.get().handCameraId;
+      select.innerHTML = '';
+      const auto = document.createElement('option');
+      auto.value = '';
+      auto.textContent = cameras.length > 1 ? 'по умолчанию (выбрать автоматически)' : 'по умолчанию';
+      select.appendChild(auto);
+      for (const camera of cameras) {
+        const option = document.createElement('option');
+        option.value = camera.id;
+        option.textContent = camera.label;
+        select.appendChild(option);
+      }
+      select.value = cameras.some((camera) => camera.id === current) ? current : '';
+    };
+    fill([]);
+    select.addEventListener('change', () => {
+      this.#prefs.set({ handCameraId: select.value, handEnabled: true });
+    });
+    head.appendChild(select);
+
+    const check = el('button', 'hud-btn', 'Проверить камеру');
+    check.style.height = '28px';
+    check.title = 'Показать превью: сразу видно, что попадает в объектив';
+    check.addEventListener('click', () => {
+      this.#prefs.set({ handShowPreview: true, handEnabled: true });
+      void this.#host.listCameras().then(fill);
+    });
+    head.appendChild(check);
+
+    field.appendChild(head);
+    // Обновляем список каждый раз, когда панель открывают.
+    this.#settingsWrap.addEventListener('transitionend', () => void this.#host.listCameras().then(fill));
+    const observer = new MutationObserver(() => {
+      if (this.#settingsWrap.style.display !== 'none') void this.#host.listCameras().then(fill);
+    });
+    observer.observe(this.#settingsWrap, { attributes: true, attributeFilter: ['style'] });
+    return field;
+  }
+
   #selectField(label: string, key: keyof Prefs, options: [string, string][]): HTMLElement {
     const field = el('div', 'hud-field');
     const head = el('div', 'hud-field-head');

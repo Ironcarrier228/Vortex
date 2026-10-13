@@ -12,7 +12,7 @@
  * ```
  */
 
-import { CameraHandSource } from './handTracker';
+import { CameraHandSource, listCameras } from './handTracker';
 import { DemoHandSource } from './demoHand';
 import { GestureController, type GestureOptions as GestureControllerOptions } from './gestureController';
 import { economyRate } from './rate';
@@ -164,7 +164,13 @@ export class GestureService {
       handCount: state.handsCount,
       hint: hintForStatus(this.#status),
       pinchText: pinchText(state, this.#status),
+      frameInfo: frameInfo(this.#status),
     });
+  }
+
+  /** Камеры для настроек (метки устройств доступны после выдачи разрешения). */
+  static listCameras(): Promise<{ id: string; label: string }[]> {
+    return listCameras();
   }
 
   dispose(): void {
@@ -208,7 +214,9 @@ export class GestureService {
     this.#teardownSource();
 
     const prefs = this.#prefs.get();
-    const source: HandSource = prefs.handDemo ? new DemoHandSource() : new CameraHandSource();
+    const source: HandSource = prefs.handDemo
+      ? new DemoHandSource()
+      : new CameraHandSource({ deviceId: prefs.handCameraId || undefined });
     source.setMaxHz?.(this.#rateHz);
     this.#source = source;
 
@@ -285,6 +293,11 @@ export class GestureService {
       this.#overlay.setVisible(prefs.handShowSkeleton || prefs.handShowPreview);
     }
 
+    // Другая камера: не перезапускаем всё распознавание — меняем только поток.
+    if (changed.includes('handCameraId') && this.#enabled && this.#source instanceof CameraHandSource) {
+      void this.#source.setDeviceId(prefs.handCameraId);
+    }
+
     // Смена источника (камера ↔ демо) требует перезапуска и снимает авто-подмену.
     if (changed.includes('handDemo') && this.#enabled) {
       this.#autoDemo = false;
@@ -337,13 +350,37 @@ export function pinchText(state: GestureState, status: SourceStatus): string {
   return `щипок ${ratio.toFixed(2)} → нужно < ${enter.toFixed(2)}`;
 }
 
-export function hintForStatus(status: SourceStatus): string {
-  if (status.phase === 'error') return 'настройки (S) → «Демо-рука» покажет жесты без камеры';
-  if (status.phase === 'running' && status.message?.includes('демо')) {
-    return 'демо-рука: синтетический сценарий, камера не используется';
+/**
+ * Строка «что приходит с камеры» для превью: разрешение, число кадров, яркость.
+ * Пользователю это важнее любых объяснений: 0 кадров — камера не отдаёт видео,
+ * тёмный кадр — закрыт объектив, а живой кадр без рук — кисть просто вне поля зрения.
+ */
+export function frameInfo(status: SourceStatus): string {
+  const parts: string[] = [];
+  if (status.device) parts.push(status.device);
+  if (status.resolution) parts.push(status.resolution);
+  if (status.frames !== undefined) parts.push(`кадров ${status.frames}`);
+  if (status.darkness !== undefined && status.darkness >= 0) {
+    parts.push(status.darkness < 12 ? 'кадр тёмный' : `яркость ${Math.round(status.darkness)}`);
   }
-  if (status.phase === 'running') return 'держите кисть в 40–80 см от камеры';
-  return '';
+  return parts.join(' · ');
+}
+
+export function hintForStatus(status: SourceStatus): string {
+  if (status.phase === 'error') return 'настройки (S) → «Демо-рука» или другая камера';
+  if (status.phase === 'running' && status.message?.includes('демо')) {
+    return 'синтетическая рука: камера не нужна';
+  }
+  // Три разные причины «рук нет» — и три разные подсказки: не получаем кадры,
+  // получаем чёрный кадр или получаем нормальный кадр, но кисть вне него.
+  if (status.phase === 'running') {
+    if (!status.frames) return 'кадры камеры не доходят — настройки (S) → «Камера»';
+    if (status.darkness !== undefined && status.darkness >= 0 && status.darkness < 12) {
+      return 'кадр почти чёрный — свет и объектив';
+    }
+    return 'держите кисть в 40–80 см от камеры';
+  }
+  return 'настройки (S) → «Демо-рука» покажет жесты без камеры';
 }
 
 export function statusLabel(status: SourceStatus): string {

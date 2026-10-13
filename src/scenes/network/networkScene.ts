@@ -45,6 +45,13 @@ const NODE_DRAG_LIMIT = 190;
 const THROW_SPEED_MIN = 52;
 /** Чувствительность вращения сцены щипком в пустоте (радианы на единицу NDC). */
 const SPACE_ROTATE_SPEED = 2.4;
+/** Пределы «сложить всю сцену»: от «в ладони» до «развернуть пошире». */
+const SCENE_SCALE_MIN = 0.05;
+const SCENE_SCALE_MAX = 1.6;
+/** Ниже этого масштаба свёрнутая сцена едет за рукой — «лежит в ладони». */
+const SCENE_PALM_SCALE = 0.42;
+/** Сколько держать щипок по чёрной дыре, прежде чем из неё вылезет орб (с). */
+const HOLE_PULL_DELAY = 0.35;
 
 export class NetworkScene implements SceneModule {
   readonly id = 'network' as const;
@@ -120,6 +127,19 @@ export class NetworkScene implements SceneModule {
     ndc: new THREE.Vector2(),
   };
   #tempVec = new THREE.Vector3();
+  #rayNdc = new THREE.Vector2();
+  /** Общий масштаб сцены: руками сводим/разводим — сцена сжимается целиком. */
+  #sceneScale = 1;
+  #sceneScaleTarget = 1;
+  /** Якорь свёрнутой сцены: мировая точка, в которой лежит «сцена в ладони». */
+  #palm = new THREE.Vector3();
+  #palmActive = false;
+  /** Щипок/нажатие по чёрной дыре: держим — она раскрывается и отдаёт орбы по одному. */
+  #holePull: { active: boolean; t: number; node: GraphNode | null } = {
+    active: false,
+    t: 0,
+    node: null,
+  };
 
   constructor(ctx: SceneContext) {
     this.#ctx = ctx;
@@ -136,6 +156,15 @@ export class NetworkScene implements SceneModule {
     });
 
     this.scene.add(this.#graph.object);
+    // Подключения вырванного орба забрал сосед — это заметное событие, говорим о нём прямо.
+    this.#graph.onTakeOver = (node, foster, links) => {
+      this.#updateDiagnostics();
+      this.#renderPanel();
+      this.#ctx.toast(
+        'info',
+        `«${node.label}» вырван из цепочки · его подключения (${links}) забрал сосед «${foster.label}»`,
+      );
+    };
     // Чёрная дыра проглотила орб: говорим об этом прямо и сразу предлагаем вернуть.
     this.#graph.onSwallow = (node, links) => {
       this.#updateDiagnostics();
@@ -391,10 +420,64 @@ export class NetworkScene implements SceneModule {
     this.#ctx.toast('info', 'Узлы возвращены: разорванные связи и проглоченные орбы на месте');
   }
 
-  /** Две руки: разведение — зум, поворот кистей — вращение вокруг центра. */
-  controlOrbit(zoom: number, twist: number): void {
-    this.#orbit.zoomBy(zoom);
+  /**
+   * Две руки. Здесь **не зум**: сводим руки — вся сцена (узлы, связи, импульсы, даже
+   * чёрная дыра) уменьшается целиком и её можно уместить в ладонь; разводим — разворачивается
+   * обратно. Поворот кистей вращает сцену вокруг центра.
+   */
+  controlScene(step: number, twist: number, center: { x: number; y: number } | null): void {
+    this.#sceneScaleTarget = Math.min(SCENE_SCALE_MAX, Math.max(SCENE_SCALE_MIN, this.#sceneScaleTarget * step));
     this.#orbit.rotateBy(twist, 0);
+    if (center && this.#sceneScaleTarget < SCENE_PALM_SCALE) {
+      this.#palmPoint(center.x, center.y, this.#palm);
+      this.#palmActive = true;
+    }
+  }
+
+  /** Совместимость: мышь зовёт то же самое (зум камеры в этой сцене не используется). */
+  controlOrbit(zoom: number, twist: number): void {
+    this.controlScene(zoom, twist, null);
+  }
+
+  /** Кнопка «Сложить сцену»: собрать всё в ладонь или развернуть обратно. */
+  #toggleCollapse(): void {
+    this.#sceneScaleTarget = this.#sceneScaleTarget < SCENE_PALM_SCALE ? 1 : 0.08;
+    this.#ctx.toast(
+      'info',
+      this.#sceneScaleTarget < SCENE_PALM_SCALE
+        ? 'Сцена складывается в ладонь — свести руки, чтобы удержать её в руке'
+        : 'Сцена разворачивается обратно',
+    );
+  }
+
+  /** Плавно применяем масштаб и ведём свёрнутую сцену за ладонью. */
+  #updateSceneScale(dt: number): void {
+    if (Math.abs(this.#sceneScaleTarget - this.#sceneScale) > 1e-4) {
+      this.#sceneScale += (this.#sceneScaleTarget - this.#sceneScale) * Math.min(1, dt * 4.5);
+      this.#graph.setGlobalScale(this.#sceneScale);
+    }
+    // Свёрнутая сцена лежит в руке: тянем её к середине между кистями.
+    if (this.#graph.globalScale < SCENE_PALM_SCALE) {
+      const two = this.#ctx.gesture.state.twoHand;
+      if (two.active) {
+        this.#palmPoint(two.centerX, two.centerY, this.#palm);
+        this.#graph.setAnchor(this.#palm);
+        this.#palmActive = true;
+        return;
+      }
+    }
+    if (this.#palmActive) {
+      this.#palmActive = false;
+      this.#graph.setAnchor(null);
+    }
+  }
+
+  /** Мировая точка под серединой рук — там, где стоит свёрнутая сцена. */
+  #palmPoint(ndcX: number, ndcY: number, out: THREE.Vector3): void {
+    this.#rayNdc.set(ndcX, ndcY);
+    this.#raycaster.setFromCamera(this.#rayNdc, this.camera);
+    const depth = this.camera.position.distanceTo(this.#orbit.target);
+    out.copy(this.#raycaster.ray.origin).addScaledVector(this.#raycaster.ray.direction, depth * 0.78);
   }
 
   /** Жест «класс»: переключить «граф» ↔ «глобус». */
@@ -556,6 +639,7 @@ export class NetworkScene implements SceneModule {
     this.#syncPointer();
     this.#updateDrag(dt);
     this.#updateSecondaryHand(dt);
+    this.#updateSceneScale(dt);
 
     if (this.#globeActive) {
       this.#updateGlobe(dt, time);
@@ -628,7 +712,8 @@ export class NetworkScene implements SceneModule {
     const normal = new THREE.Vector3();
     this.camera.getWorldDirection(normal);
     normal.negate();
-    const anchor = new THREE.Vector3(node.x ?? 0, node.y ?? 0, node.z ?? 0);
+    // Узел для плоскости берём в мировых координатах: сцена могла быть свёрнута в ладонь.
+    const anchor = this.#graph.nodeWorld(node, new THREE.Vector3());
     this.#dragPlane.setFromNormalAndCoplanarPoint(normal, anchor);
 
     const hit = this.#pointerOnDragPlane();
@@ -681,16 +766,22 @@ export class NetworkScene implements SceneModule {
     // Рукой щипок мог случиться рядом с узлом: пока палец сжат, продолжаем искать узел
     // под курсором и берём первый же — иначе жест выглядит «неработающим».
     if (!candidate) {
-      if (pointer.source !== 'hand') return;
-      const node = this.#graph.hitTest(this.camera, this.#ndc.x, this.#ndc.y, GRAB_RADIUS_HAND);
-      // Узел не поймали — значит щипок в пустоте: тянем саму сцену (граф вращается за рукой).
-      if (!node) {
+      if (pointer.source === 'hand') {
+        const node = this.#graph.hitTest(this.camera, this.#ndc.x, this.#ndc.y, GRAB_RADIUS_HAND);
+        if (node) {
+          this.#hovered = node;
+          this.#spaceHold = null;
+          this.#beginDrag(node);
+          return;
+        }
+        // Узел не поймали. Чёрная дыра: щипок по ней раскрывает её и вытаскивает орб.
+        if (this.#updateHolePull(dt)) return;
+        // Иначе щипок в пустоте: тянем саму сцену (граф вращается за рукой).
         this.#holdSpace();
         return;
       }
-      this.#hovered = node;
-      this.#spaceHold = null;
-      this.#beginDrag(node);
+      // Мышь: узла под курсором не оказалось — возможно, это чёрная дыра.
+      this.#updateHolePull(dt);
       return;
     }
 
@@ -700,7 +791,51 @@ export class NetworkScene implements SceneModule {
 
   #onPointerRelease(): void {
     this.#releaseDrag();
+    this.#releaseHole();
     this.#dragCandidate = null;
+  }
+
+  /**
+   * Щипок/нажатие по чёрной дыре. Держим — она раскрывается, и через мгновение из неё
+   * вылезает случайный проглоченный орб, который дальше едет за рукой (можно унести
+   * и оставить где угодно). Повторили — вылез следующий, пока дыра не опустеет.
+   */
+  #updateHolePull(dt: number): boolean {
+    const pointer = this.#ctx.pointer.state;
+    // Рукой берём дыру по её видимому размеру, мышью — тем же щипком (кнопкой).
+    const slack = pointer.source === 'hand' ? 0.05 : 0.02;
+    if (!this.#holePull.active) {
+      if (!this.#graph.hitHole(this.camera, this.#ndc.x, this.#ndc.y, slack)) return false;
+      if (!this.#graph.grabHole()) return false;
+      this.#holePull = { active: true, t: 0, node: null };
+      this.#ctx.toast('info', 'Чёрная дыра раскрылась — держите и тяните: орб вылезет в руку');
+      return true;
+    }
+
+    this.#holePull.t += dt;
+    if (this.#holePull.node) return true;
+
+    if (this.#holePull.t < HOLE_PULL_DELAY) return true;
+    const orb = this.#graph.extractOrb();
+    if (!orb) {
+      this.#ctx.toast('info', 'В чёрной дыре больше ничего нет');
+      this.#releaseHole();
+      return true;
+    }
+    this.#holePull.node = orb;
+    // Орб вылез из дыры — дальше он ведёт себя как обычный вырванный узел: растёт,
+    // показывается в панели и остаётся там, где его отпустят.
+    if (!this.#globeActive) this.#graph.sync(this.#connections);
+    this.#beginDrag(orb);
+    this.#ctx.toast('info', `Из чёрной дыры вылез «${orb.label}» · в дыре осталось: ${this.#graph.dumpCount}`);
+    return true;
+  }
+
+  /** Отпустили щипок по дыре: если орб не вылез, дыра просто оседает обратно. */
+  #releaseHole(): void {
+    if (!this.#holePull.active) return;
+    this.#holePull = { active: false, t: 0, node: null };
+    this.#graph.releaseHole();
   }
 
   /**
@@ -1032,6 +1167,13 @@ export class NetworkScene implements SceneModule {
     const returnRow = document.createElement('div');
     returnRow.className = 'hud-modes';
     returnRow.style.marginTop = '6px';
+    const collapseButton = document.createElement('button');
+    collapseButton.className = 'hud-btn';
+    collapseButton.textContent = 'Сложить сцену';
+    collapseButton.title = 'Сжать всю сцену целиком (не зум камеры) — тем же жестом это делают две руки';
+    collapseButton.addEventListener('click', () => this.#toggleCollapse());
+    returnRow.appendChild(collapseButton);
+
     const returnButton = document.createElement('button');
     returnButton.className = 'hud-btn';
     returnButton.textContent = 'Вернуть узлы';
@@ -1069,10 +1211,15 @@ export class NetworkScene implements SceneModule {
         : 'в 3D: глобус · нет координат (GeoIP — этап 3)';
       return;
     }
-    // Что пользователь выкинул руками: проглочено дырой и разорвано связей.
-    const eaten = this.#graph.devoured;
-    const severed = this.#graph.severedCount;
-    const extra = eaten || severed ? ` · проглочено ${eaten} · разорвано связей ${severed}` : '';
+    // Что пользователь сделал руками: передал связи соседям, выкинул орбы в дыру.
+    const handed = this.#graph.takeoverCount;
+    const inHole = this.#graph.dumpCount;
+    const scale = Math.round(this.#graph.globalScale * 100);
+    const parts: string[] = [];
+    if (handed) parts.push(`связи у соседей: ${handed}`);
+    if (inHole) parts.push(`в чёрной дыре: ${inHole}`);
+    if (scale !== 100) parts.push(`сцена ${scale}%`);
+    const extra = parts.length ? ` · ${parts.join(' · ')}` : '';
     this.#panelMode.textContent = `в 3D: ${this.#graph.nodes.length} узлов · ${this.#graph.links.length} рёбер${extra}`;
   }
 
@@ -1139,9 +1286,10 @@ export class NetworkScene implements SceneModule {
       hands.className = 'hud-label';
       hands.style.marginTop = '10px';
       hands.textContent =
-        'Руки: щипок по орбу — вырвать; рывок кистью при отпускании — чёрная дыра проглотит орб ' +
-        'вместе со связями; щипок в пустоте — вращение и наклон сцены (поворот кисти доворачивает); ' +
-        'вторая рука щипком — второй орб; развести руки — масштаб.';
+        'Руки: щипок по орбу — вырвать (его подключения заберёт сосед); рывок кистью при отпускании — ' +
+        'бросок в чёрную дыру; щипок по чёрной дыре — она раскроется и отдаст орб; щипок в пустоте — ' +
+        'вращение и наклон сцены; свести/развести две руки — сложить всю сцену в ладонь и развернуть; ' +
+        'вторая рука щипком — второй орб.';
       body.appendChild(hands);
 
       const hint = document.createElement('div');

@@ -50,6 +50,11 @@ export interface Prefs {
   handShowSkeleton: boolean;
   /** Показывать превью камеры в углу. */
   handShowPreview: boolean;
+  /**
+   * Выбранная камера (deviceId). Пусто — «по умолчанию». У ноутбуков часто две камеры
+   * (обычная и ИК для Windows Hello), и если система отдаёт вторую, рук в кадре не будет.
+   */
+  handCameraId: string;
   /** Усиление движения: рукой в воздухе можно управлять всем экраном. */
   handSensitivity: number;
   /** Сглаживание курсора 0…0.95 (One Euro Filter). */
@@ -101,6 +106,7 @@ export const DEFAULT_PREFS: Prefs = {
   handMirror: true,
   handShowSkeleton: true,
   handShowPreview: false,
+  handCameraId: '',
   handSensitivity: 1.2,
   handSmoothing: 0.55,
   handPauseGesture: false,

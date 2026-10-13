@@ -101,6 +101,14 @@ export interface GraphLink {
   cutT?: number;
   /** Какой конец оторвался. */
   cutFrom?: 'source' | 'target';
+
+  /* ── Передача соседу: связи вырванного орба переходят ближайшему орбу ── */
+  /** Откуда перелетает конец связи (позиция вырванного узла в момент передачи). */
+  flow?: { x: number; y: number; z: number };
+  /** 0..1 — прогресс перелёта: конец связи летит от вырванного орба к соседу. */
+  flowT?: number;
+  /** Какой конец перелетает. */
+  flowFrom?: 'source' | 'target';
 }
 
 export interface Pulse {
@@ -141,6 +149,8 @@ const DEVOUR_TIME = 0.62;
 const CUT_TIME = 0.34;
 /** Сколько узлов можно держать одновременно (две руки). */
 const MAX_GRAB = 2;
+/** Сколько летит конец связи, переходящей от вырванного орба к соседу (с). */
+const FLOW_TIME = 0.85;
 const SHELL_GEOMETRY = new THREE.IcosahedronGeometry(1, 1);
 const WHITE = new THREE.Color(1, 1, 1);
 
@@ -175,12 +185,28 @@ export class ForceGraph {
   #swallowed = new Set<string>();
   /** Идентификаторы разорванных связей: синхронизация их больше не создаёт. */
   #severed = new Set<string>();
+  /**
+   * Подстановка узлов: связи вырванного орба переходят соседу. `было → стало`,
+   * поэтому синхронизация собирает граф уже с новым владельцем связей, а сам
+   * вырванный орб остаётся в сцене без соединений.
+   */
+  #substitutes = new Map<string, string>();
+  /** Что лежит в чёрной дыре: узел и связи, которые надо вернуть вместе с ним. */
+  #dumps = new Map<string, { node: GraphNode; connections: NetConnection[] }>();
+  /** Общий масштаб сцены: 1 — обычный, меньше — «сложили всю сцену в ладонь». */
+  #scale = 1;
+  #anchor = new THREE.Vector3();
+  #anchorTarget: THREE.Vector3 | null = null;
+  #tempVec = new THREE.Vector3();
+  #tempVec2 = new THREE.Vector3();
   /** Кого убрать после анимации поглощения (собирается в кадре, чистится после). */
   #devouring: GraphNode[] = [];
   #cutDone: GraphLink[] = [];
   #devouredCount = 0;
   /** Сцена узнаёт о поглощении: тост, панель, счётчики. */
   onSwallow: ((node: GraphNode, links: number) => void) | null = null;
+  /** Сцена узнаёт, что связи вырванного орба перешли соседу. */
+  onTakeOver: ((node: GraphNode, foster: GraphNode, links: number) => void) | null = null;
 
   constructor() {
     this.#localNode = {
@@ -300,8 +326,11 @@ export class ForceGraph {
 
     const seen = new Set<string>(['local']);
     for (const connection of connections) {
-      const processId = `process:${connection.process}`;
-      const remoteId = `remote:${connection.remote.ip}:${connection.remote.port}:${connection.protocol}`;
+      const rawProcessId = `process:${connection.process}`;
+      const rawRemoteId = `remote:${connection.remote.ip}:${connection.remote.port}:${connection.protocol}`;
+      // Связи вырванного орба могли перейти соседу — тогда собираем граф уже с ним.
+      const processId = this.#resolve(rawProcessId);
+      const remoteId = this.#resolve(rawRemoteId);
       // Узел проглочен чёрной дырой: он вернётся только по «Вернуть узлы».
       if (this.#swallowed.has(processId) || this.#swallowed.has(remoteId)) continue;
 
@@ -340,7 +369,12 @@ export class ForceGraph {
       processNode.target = Math.min(1, processNode.target + boost * 0.4);
       remoteNode.target = Math.min(1, remoteNode.target + boost);
 
-      this.#ensureLink(`lp:${processId}`, processNode, this.#localNode, 'local-process', connection);
+      // Связь «машина ↔ процесс» не передаётся соседу: у соседа она уже есть (не плодим дубли).
+      if (processId === rawProcessId) {
+        this.#ensureLink(`lp:${processId}`, processNode, this.#localNode, 'local-process', connection);
+      } else {
+        this.#severed.add(`lp:${rawProcessId}`);
+      }
       const link = this.#ensureLink(
         `pr:${connection.id}`,
         processNode,
@@ -358,6 +392,9 @@ export class ForceGraph {
     for (let i = this.nodes.length - 1; i >= 0; i--) {
       const node = this.nodes[i];
       if (node.kind === 'local' || seen.has(node.id)) continue;
+      // Вырванный, но не проглоченный орб остаётся в сцене — его держат рукой,
+      // а его подключения живут у соседа до кнопки «Вернуть узлы».
+      if (this.#grabbed.includes(node) || this.#substitutes.has(node.id) || node.thrown) continue;
       this.#forgetGrabbed(node);
       this.nodes.splice(i, 1);
       this.#byId.delete(node.id);
@@ -405,11 +442,133 @@ export class ForceGraph {
     const existing = this.links.find((link) => link.id === id);
     if (existing) {
       existing.connection = connection;
+      // Идентификатор связи стабилен, а её концы выводятся из текущей топологии: если
+      // связи перешли соседу (или вернулись из дыры), конец должен следовать за ними.
+      if (existing.source !== source || existing.target !== target) {
+        existing.source = source;
+        existing.target = target;
+      }
       return existing;
     }
     const link: GraphLink = { id, source, target, connection, heat: 0.4, kind };
     this.links.push(link);
     return link;
+  }
+
+  /** Куда на самом деле ведут связи узла: цепочка подстановок «вырван → сосед». */
+  #resolve(id: string): string {
+    let current = id;
+    for (let hop = 0; hop < 8; hop++) {
+      const next = this.#substitutes.get(current);
+      if (!next || next === current) break;
+      current = next;
+    }
+    return current;
+  }
+
+  /**
+   * Кто из соседей заберёт связи вырванного орба. Идеальный наследник — сосед,
+   * который ходит туда же (тогда подхваченные связи выглядят правдоподобно);
+   * дальше — процессы (у них есть свои соединения), затем всё остальное и степень узла.
+   */
+  #fosterFor(node: GraphNode): GraphNode | null {
+    const near = new Set<GraphNode>();
+    const ownFar = new Set<string>();
+    for (const link of this.links) {
+      if (link.source !== node && link.target !== node) continue;
+      const other = link.source === node ? link.target : link.source;
+      if (other === node || other.devour !== undefined || this.#swallowed.has(other.id) || other.thrown) continue;
+      near.add(other);
+      ownFar.add(other.id);
+    }
+
+    // Соседи по графу плюс орбы того же типа: процессы охотно подхватывают связи процесса,
+    // хосты — связи хоста. Для пользователя это «соседний орб», а не абстрактный узел.
+    const candidates = new Set<GraphNode>(near);
+    for (const other of this.nodes) {
+      if (other === node || other.kind !== node.kind || other.kind === 'local') continue;
+      if (other.devour !== undefined || other.thrown || this.#swallowed.has(other.id)) continue;
+      candidates.add(other);
+    }
+
+    let best: GraphNode | null = null;
+    let bestScore = Number.NEGATIVE_INFINITY;
+    for (const other of candidates) {
+      // Сосед того же типа подхватывает связи естественнее всего: процесс — связи процесса,
+      // хост — связи хоста. Прямая связь по графу и «ходит туда же» добавляют уверенности.
+      let score = other.kind === node.kind ? 3 : other.kind === 'local' ? 1.5 : 1;
+      if (near.has(other)) score += 1.5;
+      if (ownFar.size > 0) {
+        for (const link of this.links) {
+          if (link.source !== other && link.target !== other) continue;
+          const far = link.source === other ? link.target : link.source;
+          if (ownFar.has(far.id)) {
+            score += 2;
+            break;
+          }
+        }
+      }
+      score += Math.min(1.2, (other.degree || 0) * 0.06);
+      // Ближний орб — это и есть сосед: чем ближе, тем охотнее отдаём связи.
+      const distance = Math.hypot(
+        (other.x ?? 0) - (node.x ?? 0),
+        (other.y ?? 0) - (node.y ?? 0),
+        (other.z ?? 0) - (node.z ?? 0),
+      );
+      score -= Math.min(2.5, distance / 80);
+      if (score > bestScore) {
+        bestScore = score;
+        best = other;
+      }
+    }
+    return best;
+  }
+
+  /**
+   * «Сосед забирает подключения»: связи вырванного орба переходят ближайшему соседу.
+   * Конец каждой связи с анимацией перелетает от вырванного орба к новому владельцу,
+   * а подстановка запоминается — синхронизация соберёт граф уже с соседом.
+   */
+  #takeOver(node: GraphNode): void {
+    if (this.#substitutes.has(node.id) || this.#swallowed.has(node.id)) return;
+    const foster = this.#fosterFor(node);
+    let moved = 0;
+    for (const link of [...this.links]) {
+      if (link.source !== node && link.target !== node) continue;
+      if (link.kind === 'local-process') {
+        // Связь «машина ↔ процесс» переходит в связь соседа (она у него уже есть).
+        this.#severLink(link, node, false);
+        continue;
+      }
+      const far = link.source === node ? link.target : link.source;
+      if (!foster || far === foster) {
+        // Наследника нет (или им оказался сам собеседник) — тогда линия рвётся с вспышкой.
+        this.#severLink(link, node, true);
+        continue;
+      }
+      this.#transfer(link, node, foster);
+      moved++;
+    }
+    if (foster && moved > 0) {
+      this.#substitutes.set(node.id, foster.id);
+      this.#refreshLinks();
+      this.onTakeOver?.(node, foster, moved);
+    }
+  }
+
+  /** Перелёт одного конца связи к соседу (визуально: линия «перепрыгивает» на соседний орб). */
+  #transfer(link: GraphLink, from: GraphNode, to: GraphNode): void {
+    if (link.cutT !== undefined) return;
+    const side: 'source' | 'target' = link.source === from ? 'source' : 'target';
+    link.flow = { x: from.x ?? 0, y: from.y ?? 0, z: from.z ?? 0 };
+    link.flowT = 0;
+    link.flowFrom = side;
+    link.absorb = 0;
+    link.rab = undefined;
+    link.orb = undefined;
+    link.rabT = undefined;
+    if (side === 'source') link.source = to;
+    else link.target = to;
   }
 
   /** Пересобрать силы физики: рвущиеся и поглощённые связи в них не участвуют. */
@@ -482,9 +641,12 @@ export class ForceGraph {
         link.rabT > LINK_ABSORB_START
           ? Math.min(1, (link.rabT - LINK_ABSORB_START) / LINK_ABSORB_TIME)
           : 0;
-      // Линия всосалась в орб целиком — соединение РАЗОрвано: оно ушло внутрь узла
-      // и обратно уже не выкатится (до «Вернуть узлы»). Это и есть «вырвать из цепочки».
-      if (link.absorb >= 1) this.#severLink(link, held, false);
+      // Линия всосалась в орб целиком — узел вырван из цепочки по-настоящему:
+      // его подключения забирает сосед (или, если соседей нет, линия рвётся с вспышкой).
+      if (link.absorb >= 1) {
+        this.#takeOver(held);
+        if (link.orb === held) this.#severLink(link, held, false);
+      }
       return;
     }
 
@@ -528,6 +690,12 @@ export class ForceGraph {
     }
     // Список нельзя менять внутри обхода — убираем проглоченных после него.
     if (this.#devouring.length > 0) this.#forgetDevoured();
+
+    // Масштаб всей сцены: «сложить всё в ладонь». Якорь тянется плавно, чтобы
+    // свёрнутая сцена не прыгала, а подъезжала к руке.
+    if (this.#anchorTarget) this.#anchor.lerp(this.#anchorTarget, Math.min(1, dt * 3.6));
+    this.object.position.copy(this.#anchor);
+    this.object.scale.setScalar(this.#scale);
 
     this.#hole.update(dt, time);
     if (camera) this.#hole.faceCamera(camera);
@@ -664,6 +832,26 @@ export class ForceGraph {
       }
       }
 
+      // Перелёт связи к соседу: конец плавно уезжает от вырванного орба к новому владельцу.
+      if (link.flow && link.flowT !== undefined) {
+        link.flowT = Math.min(1, link.flowT + dt / FLOW_TIME);
+        const t = link.flowT * link.flowT * (3 - 2 * link.flowT);
+        if (link.flowFrom === 'source') {
+          ax = link.flow.x + (ax - link.flow.x) * t;
+          ay = link.flow.y + (ay - link.flow.y) * t;
+          az = link.flow.z + (az - link.flow.z) * t;
+        } else {
+          bx = link.flow.x + (bx - link.flow.x) * t;
+          by = link.flow.y + (by - link.flow.y) * t;
+          bz = link.flow.z + (bz - link.flow.z) * t;
+        }
+        flash = Math.max(flash, 1 - link.flowT);
+        if (link.flowT >= 1) {
+          link.flow = undefined;
+          link.flowT = undefined;
+        }
+      }
+
       link.alpha = link.cutT !== undefined ? 1 - link.cutT : 1 - (link.absorb ?? 0);
       this.#linkPositions[offset] = ax;
       this.#linkPositions[offset + 1] = ay;
@@ -743,15 +931,18 @@ export class ForceGraph {
    * так наведение работает без аллокаций Raycaster-геометрии и «ловит» крупные узлы охотнее.
    */
   hitTest(camera: THREE.Camera, ndcX: number, ndcY: number, threshold = 0.045): GraphNode | null {
-    const point = new THREE.Vector3();
+    const point = this.#tempVec2;
     let best: GraphNode | null = null;
     let bestDistance = Number.POSITIVE_INFINITY;
     for (const node of this.nodes) {
-      if (node.devour !== undefined) continue;
-      point.set(node.x ?? 0, node.y ?? 0, node.z ?? 0).project(camera);
+      if (node.devour !== undefined || node.thrown) continue;
+      point.set(node.x ?? 0, node.y ?? 0, node.z ?? 0).applyMatrix4(this.object.matrixWorld).project(camera);
       if (point.z < -1 || point.z > 1) continue;
       const distance = Math.hypot(point.x - ndcX, point.y - ndcY);
-      const tolerance = threshold * (node.kind === 'local' ? 1.9 : node.kind === 'process' ? 1.25 : 0.95);
+      // Чем сильнее сцена свёрнута, тем крупнее цель: свёрнутое в ладонь тоже берётся рукой.
+      const zoomOut = 1 / Math.max(0.25, this.#scale);
+      const tolerance =
+        threshold * (node.kind === 'local' ? 1.9 : node.kind === 'process' ? 1.25 : 0.95) * Math.min(3, zoomOut);
       if (distance < tolerance && distance < bestDistance) {
         best = node;
         bestDistance = distance;
@@ -790,6 +981,140 @@ export class ForceGraph {
     return this.#severed.size;
   }
 
+  /** Сколько связей перешло соседям после вырывания орбов. */
+  get takeoverCount(): number {
+    return this.#substitutes.size;
+  }
+
+  /** Сколько орбов лежит в чёрной дыре. */
+  get dumpCount(): number {
+    return this.#dumps.size;
+  }
+
+  /** Общий масштаб сцены (1 — обычный вид). */
+  get globalScale(): number {
+    return this.#scale;
+  }
+
+  /** Мировая позиция узла: локальные единицы графа × масштаб сцены + сдвиг. */
+  nodeWorld(node: GraphNode, out = new THREE.Vector3()): THREE.Vector3 {
+    return out
+      .set(node.x ?? 0, node.y ?? 0, node.z ?? 0)
+      .multiplyScalar(this.#scale)
+      .add(this.#anchor);
+  }
+
+  /**
+   * Сложить/развернуть всю сцену: масштаб применяется к самому графу, а не к камере.
+   * Именно поэтому «сцена в ладони» — это сцена, а не зум: узлы, связи, дыра и импульсы
+   * уменьшаются вместе и остаются живыми.
+   */
+  setGlobalScale(scale: number): void {
+    this.#scale = Math.min(2, Math.max(0.04, scale));
+  }
+
+  /**
+   * Якорь сцены: куда её поставить. Свёрнутая сцена «лежит в ладони» — сцена тянет её
+   * к середине между руками; при развороте якорь возвращается в центр мира (`null`).
+   */
+  setAnchor(point: THREE.Vector3 | null): void {
+    this.#anchorTarget = point ? point.clone() : new THREE.Vector3();
+  }
+
+  /** Насколько сцена свёрнута (0 — в точку, 1 — обычный вид) — для подсказок в HUD. */
+  get collapsed(): boolean {
+    return this.#scale < 0.5;
+  }
+
+  /**
+   * Попал ли указатель по чёрной дыре. Радиус считаем прямо в NDC: проецируем центр
+   * и точку на радиус вбок от него — так размер на экране получается честным.
+   */
+  hitHole(camera: THREE.PerspectiveCamera, ndcX: number, ndcY: number, slack = 0.02): boolean {
+    if (!this.#hole.alive || this.#dumps.size === 0) return false;
+    this.object.updateMatrixWorld();
+    const centre = new THREE.Vector3()
+      .copy(this.#hole.object.position)
+      .applyMatrix4(this.object.matrixWorld)
+      .project(camera);
+    const right = new THREE.Vector3().setFromMatrixColumn(camera.matrixWorld, 0).normalize();
+    const edge = new THREE.Vector3()
+      .copy(this.#hole.object.position)
+      .applyMatrix4(this.object.matrixWorld)
+      .addScaledVector(right, this.#hole.radius * this.#scale)
+      .project(camera);
+    const radius = Math.hypot(edge.x - centre.x, edge.y - centre.y);
+    return Math.hypot(centre.x - ndcX, centre.y - ndcY) < radius + slack;
+  }
+
+  /** Взяться за чёрную дыру (щипок/нажатие по ней): она раскрывается и отдаёт орбы. */
+  grabHole(): boolean {
+    if (!this.#hole.alive || this.#dumps.size === 0) return false;
+    this.#hole.hold(true);
+    return true;
+  }
+
+  /** Отпустить дыру: она снова становится маленькой, но никуда не исчезает. */
+  releaseHole(): void {
+    this.#hole.hold(false);
+  }
+
+  /**
+   * Вытащить из дыры один случайный орб. Узел возвращается в сцену со своими связями:
+   * подстановка соседу снимается, разорванные связи оживают, и ближайшая синхронизация
+   * собирает их заново. Возвращает узел, чтобы сцена взяла его в руку.
+   */
+  extractOrb(): GraphNode | null {
+    if (this.#dumps.size === 0) return null;
+    const keys = [...this.#dumps.keys()];
+    const key = keys[Math.floor(Math.random() * keys.length)];
+    const dump = this.#dumps.get(key);
+    if (!dump) return null;
+    this.#dumps.delete(key);
+    this.#swallowed.delete(dump.node.id);
+    this.#substitutes.delete(dump.node.id);
+    for (const connection of dump.connections) {
+      this.#severed.delete(`pr:${connection.id}`);
+      this.#severed.delete(`lp:${dump.node.id}`);
+    }
+
+    const node = dump.node;
+    node.devour = undefined;
+    node.thrown = undefined;
+    node.throwT = undefined;
+    node.boost = 0;
+    node.boostTarget = 0;
+    node.spin = 0;
+    node.fx = null;
+    node.fy = null;
+    node.fz = null;
+    // Орб появляется из дыры: ставим его ровно в точку дыры (в локальных единицах графа).
+    node.x = this.#hole.object.position.x;
+    node.y = this.#hole.object.position.y;
+    node.z = this.#hole.object.position.z;
+    if (!this.nodes.includes(node)) this.nodes.push(node);
+    this.#byId.set(node.id, node);
+    this.#devouredCount = Math.max(0, this.#devouredCount - 1);
+    // Связи, ушедшие соседу, возвращаются к орбу — с тем же перелётом, что и уходили.
+    const ids = new Set(dump.connections.map((connection) => connection.id));
+    for (const link of this.links) {
+      if (link.kind !== 'process-remote' || !ids.has(link.connection.id)) continue;
+      const side: 'source' | 'target' = link.target.kind === 'remote' ? 'source' : 'target';
+      const owner = side === 'source' ? link.source : link.target;
+      if (owner === node) continue;
+      link.flow = { x: owner.x ?? 0, y: owner.y ?? 0, z: owner.z ?? 0 };
+      link.flowFrom = side;
+      link.flowT = 0;
+      if (side === 'source') link.source = node;
+      else link.target = node;
+    }
+    this.#hole.pulse(0.8);
+    if (this.#dumps.size === 0) this.#hole.close();
+    this.#rebuildInstances();
+    this.#refreshLinks();
+    return node;
+  }
+
   get hole(): BlackHole {
     return this.#hole;
   }
@@ -808,8 +1133,11 @@ export class ForceGraph {
   }
 
   /** Двигать взятый узел в мировую точку (луч курсора × плоскость узла). */
-  moveDragged(point: THREE.Vector3, node: GraphNode | null = this.dragged): void {
+  moveDragged(world: THREE.Vector3, node: GraphNode | null = this.dragged): void {
     if (!node) return;
+    // Указатель приходит в мировых координатах, а узел живёт в локальных единицах графа:
+    // учитываем и масштаб сцены, и её сдвиг (свёрнутая сцена висит у руки).
+    const point = this.#tempVec.copy(world).sub(this.#anchor).divideScalar(this.#scale);
     node.fx = point.x;
     node.fy = point.y;
     node.fz = point.z;
@@ -843,7 +1171,9 @@ export class ForceGraph {
    * броска раскрывается чёрная дыра: узел затягивает по спирали, он схлопывается в точку,
    * и все его связи рвутся. `false` — узел бросать нельзя (сама машина или уже проглочен).
    */
-  throwNode(node: GraphNode, velocity: THREE.Vector3): boolean {
+  throwNode(node: GraphNode, worldVelocity: THREE.Vector3): boolean {
+    // Скорость броска тоже переводим в локальные единицы: свёрнутая сцена летит так же резво.
+    const velocity = this.#tempVec.copy(worldVelocity).divideScalar(this.#scale);
     if (node.kind === 'local' || node.devour !== undefined || node.thrown) return false;
     this.#forgetGrabbed(node);
     node.fx = node.x ?? 0;
@@ -903,9 +1233,17 @@ export class ForceGraph {
     node.devour = 0;
     node.thrown = undefined;
     node.throwT = undefined;
+    // Подключения выкинутого орба забирает сосед — цепочка не рушится.
+    this.#takeOver(node);
+    // Содержимое орба собираем прямо сейчас: через доли секунды линий уже не будет,
+    // а вернуть их вместе с орбом нужно (это и есть «вытащить кого-нибудь из дыры»).
+    const connections: NetConnection[] = this.#dumps.get(node.id)?.connections ?? [];
     for (const link of [...this.links]) {
-      if (link.source === node || link.target === node) this.#severLink(link, node);
+      if (link.source !== node && link.target !== node) continue;
+      if (!connections.includes(link.connection)) connections.push(link.connection);
+      this.#severLink(link, node);
     }
+    this.#dumps.set(node.id, { node, connections });
     this.#hole.pulse(1);
   }
 
@@ -923,14 +1261,22 @@ export class ForceGraph {
       const index = this.nodes.indexOf(node);
       if (index >= 0) this.nodes.splice(index, 1);
       this.#byId.delete(node.id);
+      // Собираем содержимое орба: узел и все его соединения — чтобы вернуть их вместе,
+      // если пользователь засунет руку в дыру и вытащит кого-нибудь обратно.
+      const connections: NetConnection[] = [];
       let links = 0;
       for (let i = this.links.length - 1; i >= 0; i--) {
         const link = this.links[i];
         if (link.source !== node && link.target !== node) continue;
+        connections.push(link.connection);
         this.#severed.add(link.id);
         this.links.splice(i, 1);
         links++;
       }
+      // Поглощение уже собрало содержимое раньше (см. #startDevour) — не теряем его.
+      const known = this.#dumps.get(node.id)?.connections ?? [];
+      for (const connection of connections) if (!known.includes(connection)) known.push(connection);
+      this.#dumps.set(node.id, { node, connections: known });
       for (let i = this.pulses.length - 1; i >= 0; i--) {
         const pulse = this.pulses[i];
         if (pulse.link.source === node || pulse.link.target === node) this.pulses.splice(i, 1);
@@ -938,13 +1284,14 @@ export class ForceGraph {
       this.#devouredCount++;
       this.onSwallow?.(node, links);
     }
+    if (this.#dumps.size > 0) this.#hole.settle();
     for (const node of this.nodes) {
       node.degree = this.links.filter((link) => link.source === node || link.target === node).length;
     }
     this.#rebuildInstances();
     this.#refreshLinks();
     this.#hole.pulse(1);
-    this.#hole.close();
+    if (this.#dumps.size === 0) this.#hole.close();
   }
 
   /**
@@ -1005,6 +1352,8 @@ export class ForceGraph {
     for (const shell of this.#shells) shell.visible = false;
     this.#swallowed.clear();
     this.#severed.clear();
+    this.#substitutes.clear();
+    this.#dumps.clear();
     this.#devouredCount = 0;
     for (let i = this.links.length - 1; i >= 0; i--) {
       if (this.links[i].cutT !== undefined) this.links.splice(i, 1);

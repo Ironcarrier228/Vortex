@@ -81,6 +81,12 @@ export interface SceneModule {
    * пока жест активен.
    */
   controlOrbit?(zoom: number, twist: number): void;
+  /**
+   * Две руки: `step` — изменение размера, `twist` — поворот кистей, `center` — середина
+   * между руками в NDC. Сцена сети «складывает всю сцену» (масштаб содержимого, не зум
+   * камеры) и тянет её к ладони; остальные сцены используют `controlOrbit`.
+   */
+  controlScene?(step: number, twist: number, center: { x: number; y: number } | null): void;
   /** Командный жест в контексте сцены (например, «класс» = запустить скан). Вернуть true, если обработано. */
   onGesture?(name: GestureName): boolean;
   /** Панель сцены в HUD (создаётся ядром, владеет сценой). */

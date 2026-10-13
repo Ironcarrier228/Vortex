@@ -187,7 +187,13 @@ class App implements AppHost {
     const step = two.scale / (this.#lastTwoHandScale || 1);
     this.#lastTwoHandScale = two.scale;
     if (Math.abs(step - 1) > 0.0005 || Math.abs(two.twist) > 0.0004) {
-      this.#engine.currentModule?.controlOrbit?.(step, two.twist);
+      const module = this.#engine.currentModule;
+      // Сцена сети умеет «сложить всю сцену» в ладонь: масштаб содержимого, а не зум камеры.
+      if (module?.controlScene) {
+        module.controlScene(step, two.twist, { x: two.centerX, y: two.centerY });
+      } else {
+        module?.controlOrbit?.(step, two.twist);
+      }
     }
   }
 
@@ -206,6 +212,8 @@ class App implements AppHost {
   #maybeOfferCameraPreview(): void {
     if (this.outputMode || this.#handsHintShown) return;
     if (!this.gesture.enabled) return;
+    const status = this.gesture.status;
+    if (status.phase !== 'running' || status.message?.includes('демо')) return;
     if (this.#handsSince === 0) {
       this.#handsSince = performance.now();
       return;
@@ -214,19 +222,41 @@ class App implements AppHost {
       this.#handsHintShown = true;
       return;
     }
-    if (performance.now() - this.#handsSince < 8000) return;
-
+    if (performance.now() - this.#handsSince < 5000) return;
     this.#handsHintShown = true;
-    if (this.prefs.get().handShowPreview) return;
-    this.#hud.toast('warn', 'Камера не видит кисть уже 8 секунд — включить превью камеры?', {
-      action: {
-        label: 'Показать превью',
-        run: () => {
-          this.prefs.set({ handShowPreview: true });
-          this.#hud.toast('info', 'Держите раскрытую кисть в 40–80 см от камеры, ладонью к ней');
-        },
-      },
-    });
+
+    // Не спрашиваем разрешения, а показываем превью сразу: пользователь должен увидеть,
+    // что именно попадает в объектив. Это снимает 90% случаев «руки не работают».
+    if (!this.prefs.get().handShowPreview) this.prefs.set({ handShowPreview: true, handEnabled: true });
+
+    const frames = status.frames ?? 0;
+    const darkness = status.darkness ?? 99;
+    const openSettings = { label: 'Настройки', run: () => this.#hud.openSettings() };
+
+    if (frames === 0) {
+      this.#hud.toast(
+        'error',
+        'Камера открыта, но распознавание не получает кадры — в настройках (S) выберите другую камеру: ' +
+          'у ноутбуков часто две, и система отдаёт ИК-камеру Windows Hello.',
+        { action: openSettings },
+      );
+      return;
+    }
+    if (darkness < 12) {
+      this.#hud.toast(
+        'error',
+        'Кадр с камеры почти чёрный — объектив закрыт, зашторен или нет света. ' +
+          'Проверьте превью слева внизу и выберите другую камеру в настройках (S).',
+        { action: openSettings },
+      );
+      return;
+    }
+    this.#hud.toast(
+      'warn',
+      'Пять секунд без кисти. Включил превью камеры — покажите ладонь в 40–80 см от объектива, ' +
+        'пальцами вверх, и она появится в плашке.',
+      { action: openSettings },
+    );
   }
 
   #syncGestureStatus(): void {
@@ -234,15 +264,27 @@ class App implements AppHost {
     const status = this.gesture.status;
     const state = this.gesture.state;
     this.#maybeOfferCameraPreview();
+    // Диагностика камеры: разрешение, число распознанных кадров и яркость — по ним видно,
+    // работает ли камера вообще и попадает ли в объектив свет (тёмный кадр = рук не будет).
+    const dark =
+      status.darkness !== undefined && status.darkness >= 0 && status.darkness < 12
+        ? ' · кадр почти чёрный'
+        : '';
+    const frames = status.phase === 'running' && status.frames ? ` · кадров ${status.frames}` : '';
+    const resolution = status.phase === 'running' && status.resolution ? ` · ${status.resolution}` : '';
     const text = this.gesture.enabled
       ? `${statusLabel(status)}${state.handsCount > 0 ? ` · рук: ${state.handsCount}` : ''}${
           state.pose !== 'none' ? ` · ${poseLabel(state.pose)}` : ''
-        }${state.grabbed ? ' · захват' : ''}`
+        }${state.grabbed ? ' · захват' : ''}${resolution}${frames}${dark}`
       : 'жесты выключены (G)';
     this.#hud.setHandStatus(text, status.phase === 'error' ? 'error' : status.phase === 'running' ? 'ok' : '');
   }
 
   /* ─────────────────────────── AppHost ─────────────────────────── */
+
+  listCameras(): Promise<{ id: string; label: string }[]> {
+    return GestureService.listCameras();
+  }
 
   setScene(id: SceneId): void {
     if (this.#engine.currentId === id) return;

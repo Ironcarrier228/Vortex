@@ -25,6 +25,8 @@ export interface OverlayOptions {
   hint?: string;
   /** Живая настройка щипка: «щипок 0.83 → порог 0.56» — видно, почему жест не срабатывает. */
   pinchText?: string;
+  /** Что приходит с камеры: разрешение, число кадров, яркость. Пусто — источника нет. */
+  frameInfo?: string;
 }
 
 export class GestureOverlay {
@@ -86,7 +88,7 @@ export class GestureOverlay {
     const height = window.innerHeight;
     ctx.clearRect(0, 0, width, height);
 
-    if (options.showPreview) this.#drawPreview(ctx, width, height);
+    if (options.showPreview) this.#drawPreview(ctx, width, height, options);
 
     if (options.showSkeleton && this.#frame) {
       for (let index = 0; index < this.#frame.hands.length; index++) {
@@ -330,7 +332,12 @@ export class GestureOverlay {
     void options;
   }
 
-  #drawPreview(ctx: CanvasRenderingContext2D, width: number, height: number): void {
+  #drawPreview(
+    ctx: CanvasRenderingContext2D,
+    width: number,
+    height: number,
+    options: OverlayOptions,
+  ): void {
     const video = this.video;
     if (!video || video.readyState < 2) return;
 
@@ -352,11 +359,21 @@ export class GestureOverlay {
     ctx.restore();
 
     ctx.save();
-    ctx.strokeStyle = 'rgba(120, 200, 255, 0.35)';
+    // Рамка краснеет, когда модель не видит ни одной кисти — с превью это сразу понятно.
+    ctx.strokeStyle = options.handCount > 0 ? 'rgba(120, 200, 255, 0.35)' : 'rgba(255, 120, 120, 0.5)';
     ctx.lineWidth = 1.4;
     ctx.beginPath();
     ctx.roundRect(x, y, boxWidth, boxHeight, 12);
     ctx.stroke();
+    ctx.restore();
+
+    // Подпись: из превью видно, что камера отдаёт кадры, а из строки — сколько их и яркость.
+    ctx.save();
+    ctx.font = '500 11px var(--font-mono, monospace)';
+    ctx.textAlign = 'left';
+    ctx.fillStyle = options.handCount > 0 ? 'rgba(160, 220, 255, 0.9)' : 'rgba(255, 160, 160, 0.95)';
+    const note = options.handCount > 0 ? 'кисть найдена' : 'кисти не видно';
+    ctx.fillText(`${note}${options.frameInfo ? ` · ${options.frameInfo}` : ''}`, x + 2, y - 8);
     ctx.restore();
     void width;
   }

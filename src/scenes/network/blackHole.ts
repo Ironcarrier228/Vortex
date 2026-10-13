@@ -20,6 +20,8 @@ const OPEN_RATE = 7;
 const CLOSE_RATE = 3.2;
 /** Сколько живёт вспышка после поглощения (с). */
 const BURST_TIME = 0.5;
+/** Доля радиуса, до которой оседает дыра, когда внутри ещё что-то есть. */
+const IDLE_SCALE = 0.34;
 /** Сколько искр разлетается в момент поглощения. */
 const SPARK_COUNT = 72;
 
@@ -55,7 +57,9 @@ export class BlackHole {
   #sparks: THREE.Points;
   #sparkDirections: Float32Array;
 
-  #phase: 'closed' | 'opening' | 'closing' = 'closed';
+  #phase: 'closed' | 'opening' | 'idle' | 'closing' = 'closed';
+  /** Полный радиус последнего раскрытия: к нему возвращаемся, когда дыру «берут в руку». */
+  #base = 5;
   /** Текущий радиус (мировые единицы) и цель, к которой он стремится. */
   #radius = 0;
   #target = 0;
@@ -111,6 +115,11 @@ export class BlackHole {
     return this.#phase !== 'closed';
   }
 
+  /** Сейчас дыру держат (она раскрыта и готова отдать орбы). */
+  get held(): boolean {
+    return this.#phase === 'opening';
+  }
+
   /** Текущий радиус горизонта событий — по нему граф решает, что узел уже проглочен. */
   get radius(): number {
     return this.#radius;
@@ -123,7 +132,8 @@ export class BlackHole {
   /** Раскрыть дыру в точке `at`. `radius` — размер горизонта событий в мировых единицах. */
   open(at: THREE.Vector3, radius = 5): void {
     this.object.position.copy(at);
-    this.#target = Math.max(0.5, radius);
+    this.#base = Math.max(0.5, radius);
+    this.#target = this.#base;
     this.#phase = 'opening';
     this.#radius = Math.max(this.#radius, this.#target * 0.06);
     this.object.visible = true;
@@ -143,7 +153,25 @@ export class BlackHole {
     }
   }
 
-  /** Схлопнуться и погаснуть (после поглощения). */
+  /**
+   * Осесть и остаться: после поглощения дыра не исчезает, а превращается в маленькую
+   * «пылинку» — в неё можно засунуть руку и вытащить кого-нибудь обратно.
+   */
+  settle(): void {
+    if (this.#phase === 'closed') return;
+    this.#phase = 'idle';
+    this.#target = this.#base * IDLE_SCALE;
+  }
+
+  /** Взяли дыру в руку (`active`) — она раскрывается и светится; отпустили — снова оседает. */
+  hold(active: boolean): void {
+    if (this.#phase === 'closed') return;
+    this.#phase = active ? 'opening' : 'idle';
+    this.#target = active ? this.#base * 1.15 : this.#base * IDLE_SCALE;
+    if (active) this.#burst = Math.max(this.#burst, 0.5);
+  }
+
+  /** Схлопнуться и погаснуть совсем (когда внутри ничего не осталось). */
   close(): void {
     if (this.#phase === 'closed') return;
     this.#phase = 'closing';
@@ -158,7 +186,8 @@ export class BlackHole {
   update(dt: number, time: number): void {
     if (this.#phase === 'closed') return;
 
-    const rate = this.#phase === 'closing' ? CLOSE_RATE : OPEN_RATE;
+    const idle = this.#phase === 'idle';
+    const rate = this.#phase === 'closing' ? CLOSE_RATE : idle ? 2.2 : OPEN_RATE;
     if (this.#phase === 'closing') {
       this.#radius += (this.#target - this.#radius) * Math.min(1, dt * rate);
       if (this.#radius < 0.12) {
@@ -170,7 +199,7 @@ export class BlackHole {
       }
     } else {
       // Лёгкое «дыхание» открытой дыры: она живая, а не нарисованная.
-      const breath = this.#target * (1 + Math.sin(time * 3.1) * 0.035);
+      const breath = this.#target * (1 + Math.sin(time * (idle ? 1.3 : 3.1)) * 0.035);
       this.#radius += (breath - this.#radius) * Math.min(1, dt * rate);
     }
 
@@ -180,15 +209,17 @@ export class BlackHole {
     this.object.scale.setScalar(Math.max(0.001, this.#radius));
     const photon = this.#photon.material as THREE.MeshBasicMaterial;
     const glow = this.#glow.material as THREE.MeshBasicMaterial;
-    photon.opacity = 0.75 + flash * 0.25;
-    glow.opacity = 0.4 + flash * 0.5;
+    // Осевшая дыра тускнеет: она ждёт, а не светит на всю сцену.
+    const dim = idle ? 0.55 : 1;
+    photon.opacity = (0.75 + flash * 0.25) * dim;
+    glow.opacity = (0.4 + flash * 0.5) * dim;
     this.#glow.scale.setScalar(1 + flash * 0.5);
     this.#core.scale.setScalar(1 + flash * 0.25);
 
     for (let i = 0; i < this.#rings.length; i++) {
       const ring = this.#rings[i];
       const spec = DISKS[i];
-      ring.points.rotation.y += dt * spec.speed * (1 + flash * 2.4);
+      ring.points.rotation.y += dt * spec.speed * (1 + flash * 2.4) * (idle ? 0.5 : 1);
       // Разгон при вспышке слегка «раскрывает» диски — видно, что дыра сработала.
       ring.holder.rotation.z = Math.sin(time * 0.6 + i) * 0.05 + flash * 0.08;
     }
