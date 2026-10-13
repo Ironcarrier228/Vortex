@@ -10,25 +10,13 @@
  *  • **GPU, иначе CPU.** Делегат GPU требует свой canvas для WebGL-контекста; если он
  *    не поднялся (частая ситуация на старых драйверах), спокойно откатываемся на CPU.
  *  • **30 FPS распознавания** при 60 FPS рендера: `requestVideoFrameCallback`, если есть.
+ *  • **Опциональность.** Сама библиотека MediaPipe грузится в рантайме (локальная копия →
+ *    CDN), поэтому приложение собирается и работает и без неё: жесты просто покажут
+ *    понятную ошибку в статусе, а не уронят dev-сервер или сборку.
  */
 
-import type { HandLandmarker } from '@mediapipe/tasks-vision';
-
+import { loadMediaPipe, type MpFileset, type MpLandmarker } from './mediapipe';
 import type { HandFrame, HandObservation, HandSource, SourceStatus } from './types';
-
-/**
- * MediaPipe подгружается лениво: его бандл — почти мегабайт, и он не нужен тем, кто
- * не включает распознавание рук. Vite выносит библиотеку в отдельный чанк, который
- * скачивается только при первом включении жестов (и дальше живёт в кэше).
- */
-type MediaPipe = typeof import('@mediapipe/tasks-vision');
-type Fileset = Parameters<MediaPipe['HandLandmarker']['createFromOptions']>[0];
-
-let mediaPipePromise: Promise<MediaPipe> | null = null;
-function loadMediaPipe(): Promise<MediaPipe> {
-  mediaPipePromise ??= import('@mediapipe/tasks-vision');
-  return mediaPipePromise;
-}
 
 const WASM_LOCAL = '/mediapipe/wasm';
 /** Запасной источник WASM. Версия должна совпадать с зависимостью @mediapipe/tasks-vision. */
@@ -49,7 +37,7 @@ export class CameraHandSource implements HandSource {
   #frameListeners = new Set<(frame: HandFrame) => void>();
   #statusListeners = new Set<(status: SourceStatus) => void>();
 
-  #landmarker: HandLandmarker | null = null;
+  #landmarker: MpLandmarker | null = null;
   #video: HTMLVideoElement | null = null;
   #stream: MediaStream | null = null;
   #gpuCanvas: HTMLCanvasElement | null = null;
@@ -147,7 +135,7 @@ export class CameraHandSource implements HandSource {
   }
 
   /** WASM-набор: сначала локальная копия, затем CDN. */
-  async #loadFileset(): Promise<Fileset> {
+  async #loadFileset(): Promise<MpFileset> {
     this.#setStatus({ phase: 'loading-wasm', message: 'загружаю WASM' });
     const { FilesetResolver } = await loadMediaPipe();
     try {
@@ -182,7 +170,7 @@ export class CameraHandSource implements HandSource {
     );
   }
 
-  async #createLandmarker(fileset: Fileset, modelBytes: Uint8Array): Promise<HandLandmarker> {
+  async #createLandmarker(fileset: MpFileset, modelBytes: Uint8Array): Promise<MpLandmarker> {
     const { HandLandmarker } = await loadMediaPipe();
     const base = {
       modelAssetBuffer: modelBytes,

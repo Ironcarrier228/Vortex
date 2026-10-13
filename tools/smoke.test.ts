@@ -26,7 +26,11 @@ import { invoke, listen } from '../src/core/transport';
 import { PINCH_ENTER, PINCH_EXIT, classifyPose, makeSyntheticHand, pinchRatio } from '../src/core/gesture/landmarks';
 import { GestureController } from '../src/core/gesture/gestureController';
 import { DemoHandSource } from '../src/core/gesture/demoHand';
+import { loadMediaPipe } from '../src/core/gesture/mediapipe';
 import { PointerHub } from '../src/core/interaction/pointer';
+import { existsSync, readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { runInThisContext } from 'node:vm';
 import type { HandFrame, Landmark } from '../src/core/gesture/types';
 import type { DiskNodeInfo, NetSnapshot } from '../src/core/types';
 
@@ -235,6 +239,60 @@ async function main(): Promise<void> {
   check(!hubEvents.slice(3).includes('click'), 'долгий щипок — это перетаскивание, а не клик');
   hub.clearHand();
   check(!hub.state.active && hub.state.source === null, 'рука ушла из кадра — указатель снят');
+
+  console.log('Жесты: загрузка библиотеки MediaPipe (тег script → глобал Vision)');
+  // Проверяем ровно тот механизм, из-за которого раньше падал dev-сервер: библиотека
+  // подключается скриптом из public/ (или CDN), а не импортом пакета на этапе сборки.
+  const bundleFile = join(process.cwd(), 'public', 'mediapipe', 'vision_bundle.js');
+  if (!existsSync(bundleFile)) {
+    console.log('  • пропущено: нет public/mediapipe/vision_bundle.js (нужен npm run sync:mediapipe)');
+  } else {
+    const dom = globalThis as unknown as { document?: unknown; Vision?: unknown };
+    const realDocument = dom.document;
+    const created: { listeners: Record<string, (() => void)[]>; dataset: Record<string, string> }[] = [];
+
+    dom.document = {
+      querySelector: () => null,
+      createElement: () => {
+        const script = {
+          src: '',
+          dataset: {} as Record<string, string>,
+          listeners: {} as Record<string, (() => void)[]>,
+          addEventListener(type: string, listener: () => void) {
+            (this.listeners[type] ??= []).push(listener);
+          },
+          remove() {
+            /* в заглушке удалять нечего */
+          },
+        };
+        created.push(script);
+        return script;
+      },
+      head: {
+        appendChild: (script: { src: string; listeners: Record<string, (() => void)[]> }) => {
+          // Вместо сети выполняем настоящий бандл из public/: он объявляет глобал `Vision`.
+          const file = join(process.cwd(), 'public', script.src.replace(/^\//, ''));
+          if (!existsSync(file)) throw new Error(`нет файла ${file}`);
+          runInThisContext(readFileSync(file, 'utf8'));
+          setTimeout(() => (script.listeners.load ?? []).forEach((listener) => listener()), 0);
+        },
+      },
+    };
+
+    try {
+      const library = await loadMediaPipe();
+      check(
+        typeof library.HandLandmarker.createFromOptions === 'function' &&
+          typeof library.FilesetResolver.forVisionTasks === 'function',
+        'библиотека MediaPipe подключилась из локальной копии и найдена на глобале Vision',
+      );
+      check(created[0]?.src === '/mediapipe/vision_bundle.js', `первым берётся локальный путь (${created[0]?.src})`);
+    } finally {
+      dom.document = realDocument;
+      // `var Vision` в глобальном контексте — неперезаписываемое свойство: просто обнуляем.
+      dom.Vision = undefined;
+    }
+  }
 
   console.log(failures === 0 ? '\nВсе проверки пройдены ✅' : `\nПровалено проверок: ${failures} ❌`);
   process.exit(failures === 0 ? 0 : 1);
