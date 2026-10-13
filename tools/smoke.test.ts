@@ -496,15 +496,53 @@ async function main(): Promise<void> {
   wire.sync(inspectConnections);
   check(wire.links.filter((link) => link.source === donor || link.target === donor).length === 7, 'после «Вернуть узлы» всё как было');
 
+  // Режим передачи: сначала выбираем отдающего (подсветка + кандидаты), затем приёмника.
+  check(wire.sourceMark === null && wire.dropTarget === null, 'вне режима ничего не подсвечено');
+  wire.setSourceMark(receiver);
+  wire.setCandidates([donor]);
+  check(wire.sourceMark === receiver, 'отдающий орб помечен');
+  wire.setCandidates(null);
+  wire.setSourceMark(null);
+  check(wire.sourceMark === null, 'пометка снимается (выход из режима)');
+  wire.dispose();
+
+  // Режим «в два щелчка» работает и без перетаскивания: A отдаёт, B принимает, и наоборот.
+  const click = new ForceGraph();
+  click.sync(inspectConnections);
+  for (let frame = 0; frame < 120; frame++) click.update(1 / 60, frame / 60, null);
+  const first = click.nodes.find((node) => node.kind === 'process' && node.label === 'svchost')!;
+  const secondOrb = click.nodes.find((node) => node.kind === 'process' && node.label === 'node')!;
+  const candidates = click.nodes.filter((node) => node !== first && click.canRewire(first, node));
+  check(candidates.includes(secondOrb), 'приёмники видны заранее — есть куда целиться щипком');
+  const pick = click.rewire(first, secondOrb);
+  check(Boolean(pick) && pick?.moved === 6, `двумя щелчками подключения перешли приёмнику (${pick?.moved})`);
+  check(click.holderOf(first) === secondOrb, 'граф помнит, кто теперь держит подключения');
+  const back2 = click.rewire(secondOrb, first);
+  check(Boolean(back2) && back2?.moved === 12, `обратно перешло всё, что было на приёмнике (${back2?.moved})`);
+  check(click.holderOf(secondOrb) === first, 'и владелец снова первый орб');
+  click.unpinAll();
+  click.sync(inspectConnections);
+  check(
+    click.links.filter((link) => link.kind === 'process-remote' && (link.source === first || link.target === first)).length === 6,
+    '«Вернуть узлы» после ручных передач восстанавливает исходные связи',
+  );
+  click.dispose();
+
+  const wireTail = new ForceGraph();
+  wireTail.sync(inspectConnections);
+  for (let frame = 0; frame < 120; frame++) wireTail.update(1 / 60, frame / 60, null);
+
   // Орбы разных типов подключениями не меняются, «эту машину» не выбирают.
-  const host = wire.nodes.find((node) => node.kind === 'remote')!;
-  const machine = wire.nodes.find((node) => node.kind === 'local')!;
-  check(!wire.canRewire(donor, host), 'процесс и хост подключениями не меняются');
-  check(!wire.canRewire(donor, machine), '«эту машину» в приёмники не берём');
-  check(!wire.canRewire(donor, donor), 'сам с собой орб не меняется');
-  check(wire.canRewire(donor, receiver), 'два процесса — можно');
-  check(wire.rewire(donor, host) === null, 'передача между разными типами отменяется');
-  check(wire.rewire(machine, donor) === null, 'у «этой машины» подключения забрать нельзя');
+  const donor2 = wireTail.nodes.find((node) => node.kind === 'process' && node.label === 'svchost')!;
+  const receiver2 = wireTail.nodes.find((node) => node.kind === 'process' && node.label === 'node')!;
+  const host = wireTail.nodes.find((node) => node.kind === 'remote')!;
+  const machine = wireTail.nodes.find((node) => node.kind === 'local')!;
+  check(!wireTail.canRewire(donor2, host), 'процесс и хост подключениями не меняются');
+  check(!wireTail.canRewire(donor2, machine), '«эту машину» в приёмники не берём');
+  check(!wireTail.canRewire(donor2, donor2), 'сам с собой орб не меняется');
+  check(wireTail.canRewire(donor2, receiver2), 'два процесса — можно');
+  check(wireTail.rewire(donor2, host) === null, 'передача между разными типами отменяется');
+  check(wireTail.rewire(machine, donor2) === null, 'у «этой машины» подключения забрать нельзя');
 
   // Хост ↔ хост: подключения хоста переезжают другому хосту — тоже работает.
   const hostWire = new ForceGraph();
@@ -543,11 +581,11 @@ async function main(): Promise<void> {
   holeView.dispose();
 
   // Приёмник подсвечивается — сцена видит, куда перейдут подключения.
-  wire.setDropTarget(receiver);
-  check(wire.dropTarget === receiver, 'орб-приёмник подсвечен');
-  wire.setDropTarget(null);
-  check(wire.dropTarget === null, 'подсветка снимается');
-  wire.dispose();
+  wireTail.setDropTarget(receiver2);
+  check(wireTail.dropTarget === receiver2, 'орб-приёмник подсвечен');
+  wireTail.setDropTarget(null);
+  check(wireTail.dropTarget === null, 'подсветка снимается');
+  wireTail.dispose();
 
   // ── Масштаб сцены: «сложить всю сцену в ладонь» — это не зум камеры ──
   const sample = holeGraph.nodes[0];

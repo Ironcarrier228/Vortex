@@ -135,6 +135,14 @@ export class NetworkScene implements SceneModule {
   /** Якорь свёрнутой сцены: мировая точка, в которой лежит «сцена в ладони». */
   #palm = new THREE.Vector3();
   #palmActive = false;
+  /**
+   * Режим передачи подключений. Мышь или рука — без разницы: первым щелчком выбираем
+   * отдающий орб, вторым — приёмник. Тянуть и целиться не нужно — это и был камень
+   * преткновения при перетаскивании руками.
+   */
+  #transferMode = false;
+  #transferSource: GraphNode | null = null;
+  #transferButton: HTMLButtonElement | null = null;
   /** Щипок/нажатие по чёрной дыре: держим — она раскрывается и отдаёт орбы по одному. */
   #holePull: { active: boolean; t: number; node: GraphNode | null } = {
     active: false,
@@ -489,7 +497,19 @@ export class NetworkScene implements SceneModule {
   }
 
   #onKeyDown = (event: KeyboardEvent): void => {
+    const target = event.target as HTMLElement | null;
+    if (target && (target.tagName === 'INPUT' || target.tagName === 'SELECT' || target.tagName === 'TEXTAREA')) return;
+    if (event.code === 'KeyT') {
+      this.#toggleTransferMode();
+      return;
+    }
     if (event.code === 'Escape') {
+      // Сначала выходим из режима передачи, и только потом снимаем выделение.
+      if (this.#transferMode) {
+        if (this.#transferSource) this.#clearTransferSelection();
+        else this.#setTransferMode(false);
+        return;
+      }
       this.#selected = null;
       this.#renderPanel();
     }
@@ -696,6 +716,13 @@ export class NetworkScene implements SceneModule {
   #updateDropTarget(): void {
     const node = this.#graph.dragged;
     if (!this.#dragging || !node || this.#globeActive) {
+      // В режиме передачи подсвечиваем будущий приёмник под курсором — тот, что выберет щелчок.
+      if (this.#transferMode && this.#transferSource && !this.#globeActive) {
+        const hovered = this.#hovered;
+        const usable = this.#graph.canRewire(this.#transferSource, hovered) ? hovered : null;
+        if (this.#graph.dropTarget !== usable) this.#graph.setDropTarget(usable);
+        return;
+      }
       if (this.#graph.dropTarget) this.#graph.setDropTarget(null);
       return;
     }
@@ -928,6 +955,93 @@ export class NetworkScene implements SceneModule {
     }
   }
 
+  /**
+   * Режим передачи подключений. Первый щелчок (или щипок) по орбу — он отдаёт, второй
+   * по другому орбу того же типа — принимает. Никакого перетаскивания: рукой достаточно
+   * двух уверенных щипков, а подсветка показывает, куда целиться.
+   */
+  #setTransferMode(on: boolean): void {
+    if (this.#transferMode === on) return;
+    this.#transferMode = on;
+    this.#clearTransferSelection();
+    if (this.#transferButton) this.#transferButton.classList.toggle('active', on);
+    this.#ctx.toast(
+      'info',
+      on
+        ? 'Режим передачи подключений: щёлкните (или щипните) орб, который отдаёт, затем орб того же типа, который принимает. Esc — выход'
+        : 'Режим передачи подключений выключен',
+    );
+    this.#updateDiagnostics();
+    this.#renderPanel();
+  }
+
+  #toggleTransferMode(): void {
+    this.#setTransferMode(!this.#transferMode);
+  }
+
+  /**
+   * Щелчок по орбу в режиме передачи: первый выбирает отдающего, второй — приёмника.
+   * Повторный щелчок по отдающему снимает выбор.
+   */
+  #transferPick(node: GraphNode | null): boolean {
+    const source = this.#transferSource;
+
+    if (!source) {
+      if (!node || node.kind === 'local') {
+        this.#ctx.toast('warn', 'Первым выберите орб, у которого забрать подключения (процесс или хост)');
+        return true;
+      }
+      this.#transferSource = node;
+      this.#graph.setSourceMark(node);
+      this.#graph.setCandidates(
+        this.#graph.nodes.filter((candidate) => candidate !== node && this.#graph.canRewire(node, candidate)),
+      );
+      const count = this.#graph.connectionsOf(node).length;
+      this.#ctx.toast(
+        'info',
+        `Отдаёт «${node.label}» · подключений: ${count}. Теперь щёлкните орб того же типа, который примет`,
+      );
+      this.#renderPanel();
+      return true;
+    }
+
+    if (!node || node === source) {
+      this.#clearTransferSelection();
+      this.#ctx.toast('info', 'Выбор снят');
+      return true;
+    }
+
+    const result = this.#graph.canRewire(source, node) ? this.#graph.rewire(source, node) : null;
+    if (!result) {
+      this.#ctx.toast(
+        'warn',
+        `«${node.label}» не подходит приёмником: нужен орб того же типа (${source.kind === 'process' ? 'процесс' : 'хост'})`,
+      );
+      return true;
+    }
+
+    const from = source;
+    this.#clearTransferSelection();
+    if (!this.#globeActive) this.#graph.sync(this.#connections);
+    this.#selected = node;
+    this.#updateDiagnostics();
+    this.#renderPanel();
+    this.#ctx.toast(
+      'info',
+      `Подключения (${result.moved}) с «${from.label}» перешли орбу «${node.label}» · выберите следующий орб для ещё одной передачи`,
+      { action: { label: 'Обратно', run: () => this.#undoRewire() } },
+    );
+    return true;
+  }
+
+  #clearTransferSelection(): void {
+    this.#transferSource = null;
+    this.#graph.setSourceMark(null);
+    this.#graph.setCandidates(null);
+    this.#graph.setDropTarget(null);
+    this.#renderPanel();
+  }
+
   /** «Обратно»: подключения возвращаются прежнему орбу — и линии, и владелец в графе. */
   #undoRewire(): void {
     if (!this.#graph.undoRewire()) return;
@@ -1075,6 +1189,8 @@ export class NetworkScene implements SceneModule {
   /** Короткое нажатие = выбор узла (мышью или щипком). */
   #onPointerClick(): void {
     if (this.#dragging) return;
+    // В режиме передачи короткий щипок/клик не выбирает узел, а назначает отдающего и приёмника.
+    if (this.#transferMode && this.#transferPick(this.#globeActive ? null : this.#hovered)) return;
     if (this.#globeActive || !this.#hovered) {
       this.#selected = null;
       this.#renderPanel();
@@ -1256,6 +1372,18 @@ export class NetworkScene implements SceneModule {
     const returnRow = document.createElement('div');
     returnRow.className = 'hud-modes';
     returnRow.style.marginTop = '6px';
+
+    // Режим передачи подключений: включил, щёлкнул отдающий орб, щёлкнул приёмник.
+    const transferButton = document.createElement('button');
+    transferButton.className = 'hud-btn';
+    transferButton.dataset.action = 'transfer';
+    transferButton.textContent = 'Передать подключения';
+    transferButton.title =
+      'Режим передачи: щёлкните орб, который отдаёт, затем орб того же типа, который принимает (T)';
+    transferButton.addEventListener('click', () => this.#toggleTransferMode());
+    returnRow.appendChild(transferButton);
+    this.#transferButton = transferButton;
+
     const collapseButton = document.createElement('button');
     collapseButton.className = 'hud-btn';
     collapseButton.textContent = 'Сложить сцену';
@@ -1308,6 +1436,9 @@ export class NetworkScene implements SceneModule {
     if (handed) parts.push(`связи у соседей: ${handed}`);
     const rewired = this.#graph.rewireCount;
     if (rewired) parts.push(`передано руками: ${rewired}`);
+    if (this.#transferMode) {
+      parts.push(this.#transferSource ? `передача: отдаёт «${this.#transferSource.label}»` : 'режим передачи');
+    }
     if (inHole) parts.push(`в чёрной дыре: ${inHole}`);
     if (scale !== 100) parts.push(`сцена ${scale}%`);
     const extra = parts.length ? ` · ${parts.join(' · ')}` : '';
@@ -1355,9 +1486,13 @@ export class NetworkScene implements SceneModule {
           })()
         }
         ${
-          pinned
-            ? '<div class="hud-label" style="margin-top:6px">орб в руке/оставлен · отпустите его НА другом орбе — подключения перейдут тому; «Вернуть узлы» возвращает всё</div>'
-            : '<div class="hud-label" style="margin-top:6px">щипок — вырвать; перетащите на другой орб и отпустите — подключения перейдут ему; рывок при отпускании — в чёрную дыру</div>'
+          this.#transferMode
+            ? this.#transferSource
+              ? `<div class="hud-label" style="margin-top:6px">режим передачи · отдаёт «${escapeHtml(this.#transferSource.label)}» · щёлкните орб того же типа, который примет</div>`
+              : '<div class="hud-label" style="margin-top:6px">режим передачи · щёлкните орб, у которого забрать подключения</div>'
+            : pinned
+              ? '<div class="hud-label" style="margin-top:6px">орб в руке/оставлен · отпустите его НА другом орбе — подключения перейдут тому; «Вернуть узлы» возвращает всё</div>'
+              : '<div class="hud-label" style="margin-top:6px">щипок — вырвать; рывок при отпускании — в чёрную дыру; режим «Передать подключения» — щёлкни отдающий орб, затем приёмник</div>'
         }`;
       const list = document.createElement('div');
       list.className = 'hud-group';
@@ -1395,7 +1530,8 @@ export class NetworkScene implements SceneModule {
         'Руки: щипок по орбу — вырвать (его подключения заберёт сосед); рывок кистью при отпускании — ' +
         'бросок в чёрную дыру; щипок по чёрной дыре — она раскроется и отдаст орб; щипок в пустоте — ' +
         'вращение и наклон сцены; свести/развести две руки — сложить всю сцену в ладонь и развернуть; ' +
-        'вторая рука щипком — второй орб.';
+        'вторая рука щипком — второй орб. Передать подключения: кнопка «Передать подключения» (или T) — ' +
+        'щипните отдающий орб, затем приёмник. Перетаскивание орба на орб тоже работает.';
       body.appendChild(hands);
 
       const hint = document.createElement('div');

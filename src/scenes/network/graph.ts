@@ -205,6 +205,10 @@ export class ForceGraph {
   }[] = [];
   /** Орб, который примет подключения, если отпустить здесь (подсвечивается). */
   #dropTarget: GraphNode | null = null;
+  /** Отдающий орб в режиме передачи: помечен розовым, пока выбирают приёмник. */
+  #sourceMark: GraphNode | null = null;
+  /** Все орбы, которым можно передать подключения (в режиме — подсвечиваются заранее). */
+  #candidates: Set<GraphNode> | null = null;
   /** Общий масштаб сцены: 1 — обычный, меньше — «сложили всю сцену в ладонь». */
   #scale = 1;
   #anchor = new THREE.Vector3();
@@ -723,7 +727,8 @@ export class ForceGraph {
       const pulse = 1 + Math.sin(time * (2.4 + node.intensity * 3) + i) * 0.08 * node.intensity;
       const base =
         node.kind === 'local' ? 5.4 : node.kind === 'process' ? 2.1 + Math.min(node.degree, 12) * 0.12 : 1.35;
-      const hint = node === this.#dropTarget ? 0.5 : 0;
+      const hint =
+        node === this.#dropTarget ? 0.5 : node === this.#sourceMark ? 0.4 : this.#candidates?.has(node) ? 0.2 : 0;
       const inspect = 1 + ((node.boost ?? 0) + hint) * (node.kind === 'remote' ? 2.6 : 1.9);
       const eaten = 1 - Math.min(1, node.devour ?? 0);
       const size = base * (0.85 + node.intensity * 0.55) * pulse * inspect * eaten;
@@ -746,8 +751,11 @@ export class ForceGraph {
       } else {
         color.multiplyScalar(0.65 + node.intensity * 0.6);
       }
-      // Приёмник подключений подсвечиваем белым: сразу видно, куда они перейдут.
+      // Приёмник подключений подсвечиваем белым, отдающий в режиме — розовым,
+      // а всех кандидатов — лёгким свечением: сразу видно, куда целиться.
       if (node === this.#dropTarget) color.lerp(WHITE, 0.45);
+      else if (node === this.#sourceMark) color.lerp(NEON.pink, 0.5);
+      else if (this.#candidates?.has(node)) color.lerp(WHITE, 0.16);
       // Поглощаемый узел гаснет вместе с размером.
       if (eaten < 1) color.multiplyScalar(0.3 + eaten * 0.7);
       this.#nodeMesh.setColorAt(i, color);
@@ -1369,6 +1377,23 @@ export class ForceGraph {
     return this.#dropTarget;
   }
 
+  /** Отдающий орб режима передачи: помечаем розовым, чтобы не потерять, кто отдаёт. */
+  get sourceMark(): GraphNode | null {
+    return this.#sourceMark;
+  }
+
+  setSourceMark(node: GraphNode | null): void {
+    this.#sourceMark = node;
+  }
+
+  /**
+   * Список орбов, которым можно передать подключения. В режиме передачи подсвечиваются все
+   * подходящие: видно, куда целиться, — рукой это важнее точности наведения.
+   */
+  setCandidates(nodes: Iterable<GraphNode> | null): void {
+    this.#candidates = nodes ? new Set(nodes) : null;
+  }
+
   /** Подсветить орб-приёмник (или снять подсветку): видно, куда перейдут подключения. */
   setDropTarget(node: GraphNode | null): void {
     if (this.#dropTarget === node) return;
@@ -1486,6 +1511,8 @@ export class ForceGraph {
     }
     this.#grabbed.length = 0;
     this.#dropTarget = null;
+    this.#sourceMark = null;
+    this.#candidates = null;
     this.#rewireLog.length = 0;
     this.#devouring.length = 0;
     this.#cutDone.length = 0;
