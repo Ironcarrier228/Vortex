@@ -13,7 +13,13 @@ import * as THREE from 'three';
 import { invoke, listen } from '../../core/transport';
 import { OrbitCamera } from '../../core/interaction/orbit';
 import { angleDelta } from '../../core/gesture/landmarks';
-import { ForceGraph, type GraphNode } from './graph';
+import {
+  ForceGraph,
+  HOLE_EJECT_SPEED,
+  holeOutcome,
+  holeOutcomeLabel,
+  type GraphNode,
+} from './graph';
 import type { NetConnection, NetSnapshot } from '../../core/types';
 import type { SceneContext, SceneModule, SceneState } from '../../core/scene';
 
@@ -52,6 +58,12 @@ const SCENE_SCALE_MAX = 1.6;
 const SCENE_PALM_SCALE = 0.42;
 /** Сколько держать щипок по чёрной дыре, прежде чем из неё вылезет орб (с). */
 const HOLE_PULL_DELAY = 0.35;
+/** Смещение указателя (NDC), после которого удержание дыры становится растягиванием. */
+const HOLE_STRETCH_DRAG = 0.05;
+/** Растяжение «на единицу»: 0.22 NDC пути рукой = +1.0 к растяжению. */
+const HOLE_STRETCH_PER_NDC = 0.22;
+/** На каком расстоянии между щипками двух рук орбы сливаются (NDC). */
+const MERGE_DISTANCE_NDC = 0.13;
 
 export class NetworkScene implements SceneModule {
   readonly id = 'network' as const;
@@ -140,15 +152,31 @@ export class NetworkScene implements SceneModule {
    * отдающий орб, вторым — приёмник. Тянуть и целиться не нужно — это и был камень
    * преткновения при перетаскивании руками.
    */
-  #transferMode = false;
+  #pointMode: 'transfer' | 'merge' | null = null;
   #transferSource: GraphNode | null = null;
   #transferButton: HTMLButtonElement | null = null;
+  #mergeButton: HTMLButtonElement | null = null;
+  /** Растягивание дыры: двумя руками (расстояние между щипками) или перетаскиванием. */
+  #stretch: {
+    active: boolean;
+    baseline: number;
+    factor: number;
+    warned: { explode: boolean; void: boolean };
+  } = { active: false, baseline: 0, factor: 1, warned: { explode: false, void: false } };
+  /** Затухание после взрыва/поглощения: экран темнеет, сцена «уходит». */
+  #void: HTMLDivElement | null = null;
+  /** Пауза после слияния: не даём рукам слить то же самое второй раз подряд. */
+  #mergeCooldown = 0;
+  /** Сколько секунд растянутая дыра уже без рук: даём жесту миг на возврат, потом решаем. */
+  #stretchLost = 0;
   /** Щипок/нажатие по чёрной дыре: держим — она раскрывается и отдаёт орбы по одному. */
-  #holePull: { active: boolean; t: number; node: GraphNode | null } = {
-    active: false,
-    t: 0,
-    node: null,
-  };
+  #holePull: {
+    active: boolean;
+    t: number;
+    node: GraphNode | null;
+    /** Откуда начали тянуть дыру: по смещению понимаем, что это растягивание, а не выемка орба. */
+    pointerStart: { x: number; y: number } | null;
+  } = { active: false, t: 0, node: null, pointerStart: null };
 
   constructor(ctx: SceneContext) {
     this.#ctx = ctx;
@@ -461,6 +489,7 @@ export class NetworkScene implements SceneModule {
 
   /** Плавно применяем масштаб и ведём свёрнутую сцену за ладонью. */
   #updateSceneScale(dt: number): void {
+    if (this.#mergeCooldown > 0) this.#mergeCooldown = Math.max(0, this.#mergeCooldown - dt);
     if (Math.abs(this.#sceneScaleTarget - this.#sceneScale) > 1e-4) {
       this.#sceneScale += (this.#sceneScaleTarget - this.#sceneScale) * Math.min(1, dt * 4.5);
       this.#graph.setGlobalScale(this.#sceneScale);
@@ -503,11 +532,15 @@ export class NetworkScene implements SceneModule {
       this.#toggleTransferMode();
       return;
     }
+    if (event.code === 'KeyY') {
+      this.#toggleMergeMode();
+      return;
+    }
     if (event.code === 'Escape') {
       // Сначала выходим из режима передачи, и только потом снимаем выделение.
-      if (this.#transferMode) {
+      if (this.#pointMode) {
         if (this.#transferSource) this.#clearTransferSelection();
-        else this.#setTransferMode(false);
+        else this.#setPointMode(null);
         return;
       }
       this.#selected = null;
@@ -662,6 +695,8 @@ export class NetworkScene implements SceneModule {
     this.#updateSecondaryHand(dt);
     this.#updateSceneScale(dt);
     this.#updateDropTarget();
+    this.#updateStretch(dt);
+    this.#updateHandOver();
 
     if (this.#globeActive) {
       this.#updateGlobe(dt, time);
@@ -717,7 +752,7 @@ export class NetworkScene implements SceneModule {
     const node = this.#graph.dragged;
     if (!this.#dragging || !node || this.#globeActive) {
       // В режиме передачи подсвечиваем будущий приёмник под курсором — тот, что выберет щелчок.
-      if (this.#transferMode && this.#transferSource && !this.#globeActive) {
+      if (this.#pointMode && this.#transferSource && !this.#globeActive) {
         const hovered = this.#hovered;
         const usable = this.#graph.canRewire(this.#transferSource, hovered) ? hovered : null;
         if (this.#graph.dropTarget !== usable) this.#graph.setDropTarget(usable);
@@ -835,6 +870,7 @@ export class NetworkScene implements SceneModule {
   #onPointerRelease(): void {
     this.#releaseDrag();
     this.#releaseHole();
+    if (this.#stretch.active) this.#finishStretch();
     this.#dragCandidate = null;
   }
 
@@ -844,13 +880,15 @@ export class NetworkScene implements SceneModule {
    * и оставить где угодно). Повторили — вылез следующий, пока дыра не опустеет.
    */
   #updateHolePull(dt: number): boolean {
+    // Дыру растягивают — она занята: не вытаскиваем орб и не перехватываем жест.
+    if (this.#stretch.active) return true;
     const pointer = this.#ctx.pointer.state;
     // Рукой берём дыру по её видимому размеру, мышью — тем же щипком (кнопкой).
     const slack = pointer.source === 'hand' ? 0.05 : 0.02;
     if (!this.#holePull.active) {
       if (!this.#graph.hitHole(this.camera, this.#ndc.x, this.#ndc.y, slack)) return false;
       if (!this.#graph.grabHole()) return false;
-      this.#holePull = { active: true, t: 0, node: null };
+      this.#holePull = { active: true, t: 0, node: null, pointerStart: { x: this.#ndc.x, y: this.#ndc.y } };
       this.#ctx.toast('info', 'Чёрная дыра раскрылась — держите и тяните: орб вылезет в руку');
       return true;
     }
@@ -877,7 +915,7 @@ export class NetworkScene implements SceneModule {
   /** Отпустили щипок по дыре: если орб не вылез, дыра просто оседает обратно. */
   #releaseHole(): void {
     if (!this.#holePull.active) return;
-    this.#holePull = { active: false, t: 0, node: null };
+    this.#holePull = { active: false, t: 0, node: null, pointerStart: null };
     this.#graph.releaseHole();
   }
 
@@ -960,23 +998,30 @@ export class NetworkScene implements SceneModule {
    * по другому орбу того же типа — принимает. Никакого перетаскивания: рукой достаточно
    * двух уверенных щипков, а подсветка показывает, куда целиться.
    */
-  #setTransferMode(on: boolean): void {
-    if (this.#transferMode === on) return;
-    this.#transferMode = on;
+  #setPointMode(mode: 'transfer' | 'merge' | null): void {
+    if (this.#pointMode === mode) return;
+    this.#pointMode = mode;
     this.#clearTransferSelection();
-    if (this.#transferButton) this.#transferButton.classList.toggle('active', on);
+    this.#transferButton?.classList.toggle('active', mode === 'transfer');
+    this.#mergeButton?.classList.toggle('active', mode === 'merge');
     this.#ctx.toast(
       'info',
-      on
+      mode === 'transfer'
         ? 'Режим передачи подключений: щёлкните (или щипните) орб, который отдаёт, затем орб того же типа, который принимает. Esc — выход'
-        : 'Режим передачи подключений выключен',
+        : mode === 'merge'
+          ? 'Режим слияния: щёлкните орб, который растворится, затем орб того же типа, в который он сольётся. Esc — выход'
+          : 'Режим указания орбов выключен',
     );
     this.#updateDiagnostics();
     this.#renderPanel();
   }
 
   #toggleTransferMode(): void {
-    this.#setTransferMode(!this.#transferMode);
+    this.#setPointMode(this.#pointMode === 'transfer' ? null : 'transfer');
+  }
+
+  #toggleMergeMode(): void {
+    this.#setPointMode(this.#pointMode === 'merge' ? null : 'merge');
   }
 
   /**
@@ -985,6 +1030,7 @@ export class NetworkScene implements SceneModule {
    */
   #transferPick(node: GraphNode | null): boolean {
     const source = this.#transferSource;
+    const merge = this.#pointMode === 'merge';
 
     if (!source) {
       if (!node || node.kind === 'local') {
@@ -999,7 +1045,9 @@ export class NetworkScene implements SceneModule {
       const count = this.#graph.connectionsOf(node).length;
       this.#ctx.toast(
         'info',
-        `Отдаёт «${node.label}» · подключений: ${count}. Теперь щёлкните орб того же типа, который примет`,
+        merge
+          ? `«${node.label}» растворится в выбранном орбе · подключений: ${count}. Щёлкните того, в кого сливать`
+          : `Отдаёт «${node.label}» · подключений: ${count}. Теперь щёлкните орб того же типа, который примет`,
       );
       this.#renderPanel();
       return true;
@@ -1011,26 +1059,39 @@ export class NetworkScene implements SceneModule {
       return true;
     }
 
-    const result = this.#graph.canRewire(source, node) ? this.#graph.rewire(source, node) : null;
-    if (!result) {
+    const allowed = merge ? this.#graph.canMerge(source, node) : this.#graph.canRewire(source, node);
+    if (!allowed) {
       this.#ctx.toast(
         'warn',
-        `«${node.label}» не подходит приёмником: нужен орб того же типа (${source.kind === 'process' ? 'процесс' : 'хост'})`,
+        `«${node.label}» не подходит: нужен орб того же типа (${source.kind === 'process' ? 'процесс' : 'хост'})`,
       );
       return true;
     }
 
     const from = source;
+    const merged = merge ? this.#graph.merge(from, node) : null;
+    const result = merge ? null : this.#graph.rewire(from, node);
     this.#clearTransferSelection();
     if (!this.#globeActive) this.#graph.sync(this.#connections);
     this.#selected = node;
     this.#updateDiagnostics();
     this.#renderPanel();
-    this.#ctx.toast(
-      'info',
-      `Подключения (${result.moved}) с «${from.label}» перешли орбу «${node.label}» · выберите следующий орб для ещё одной передачи`,
-      { action: { label: 'Обратно', run: () => this.#undoRewire() } },
-    );
+
+    if (merged) {
+      this.#ctx.toast(
+        'info',
+        `«${merged.label}» слит с «${node.label}» · орбы объединены, подключений теперь ${this.#graph.connectionsOf(node).length}`,
+        { action: { label: 'Обратно', run: () => this.#undoRewire() } },
+      );
+      return true;
+    }
+    if (result) {
+      this.#ctx.toast(
+        'info',
+        `Подключения (${result.moved}) с «${from.label}» перешли орбу «${node.label}» · выберите следующий орб для ещё одной передачи`,
+        { action: { label: 'Обратно', run: () => this.#undoRewire() } },
+      );
+    }
     return true;
   }
 
@@ -1057,6 +1118,8 @@ export class NetworkScene implements SceneModule {
    * не отпуская щипок и не трогая мышь.
    */
   #holdSpace(): void {
+    // Дыру растягивают — жест занят дырой, сцену под ним не крутим.
+    if (this.#stretch.active) return;
     const roll = this.#ctx.gesture.state.roll;
     if (this.#spaceHold) {
       const dx = this.#ndc.x - this.#spaceHold.x;
@@ -1113,6 +1176,36 @@ export class NetworkScene implements SceneModule {
     }
 
     this.#second.ndc.set(cursor.ndcX, cursor.ndcY);
+
+    // Две руки держат два орба и сводят их вместе — это слияние: орбы становятся одним.
+    const primary = this.#graph.dragged;
+    if (primary && primary !== node && this.#graph.canMerge(node, primary)) {
+      const distance = Math.hypot(
+        this.#ctx.gesture.state.cursor.ndcX - cursor.ndcX,
+        this.#ctx.gesture.state.cursor.ndcY - cursor.ndcY,
+      );
+      if (distance < MERGE_DISTANCE_NDC && this.#mergeCooldown <= 0) {
+        const merged = this.#graph.merge(node, primary);
+        if (merged) {
+          this.#mergeCooldown = 1.2;
+          this.#second.node = null;
+          this.#graph.setBoost(node, 0);
+          this.#graph.endDrag(true, node);
+          this.#second.hasLast = false;
+          if (!this.#globeActive) this.#graph.sync(this.#connections);
+          this.#selected = primary;
+          this.#updateDiagnostics();
+          this.#renderPanel();
+          this.#ctx.toast(
+            'info',
+            `Орбы слились: «${merged.label}» растворился в «${primary.label}» · подключений теперь ${this.#graph.connectionsOf(primary).length}`,
+            { action: { label: 'Обратно', run: () => this.#undoRewire() } },
+          );
+          return;
+        }
+      }
+    }
+
     const hit = this.#secondOnPlane();
     if (!hit) return;
     const point = this.#second.point.copy(hit).add(this.#second.offset);
@@ -1187,10 +1280,227 @@ export class NetworkScene implements SceneModule {
   }
 
   /** Короткое нажатие = выбор узла (мышью или щипком). */
+  /**
+   * Растягивание чёрной дыры. Двумя руками: щипок на дыре обеими руками и разводим —
+   * расстояние между кистями задаёт растяжение. Одной рукой (или мышью): взяли дыру
+   * и потянули в сторону. Пока тянем, дыра ест всё, что попало за горизонт событий,
+   * а отпускание решает судьбу: схлопнуть (вернёт орбы), взорвать (орбы разлетаются)
+   * или поглотить всё.
+   */
+  #updateStretch(dt: number): void {
+    const gesture = this.#ctx.gesture.state;
+    const pointer = this.#ctx.pointer.state;
+    const twoHands =
+      gesture.pinch.active && gesture.secondaryPinch && gesture.secondaryCursor.active;
+
+    if (!this.#stretch.active) {
+      const onHole = (x: number, y: number): boolean => this.#graph.hitHole(this.camera, x, y, 0.06);
+      // Две руки щиплют дыру — классический жест «развести руками».
+      const bothOnHole =
+        twoHands &&
+        onHole(gesture.cursor.ndcX, gesture.cursor.ndcY) &&
+        onHole(gesture.secondaryCursor.ndcX, gesture.secondaryCursor.ndcY);
+      // Одна рука или мышь: держим дыру и тянем. Орб в руке — не растягиваем: там другой жест.
+      const anchor = this.#holePull.pointerStart ?? this.#dragStartNdc;
+      const holding =
+        !this.#dragging &&
+        this.#holePull.node === null &&
+        (this.#holePull.active || (pointer.pressed && onHole(this.#ndc.x, this.#ndc.y)));
+      const pulled =
+        holding && Math.hypot(this.#ndc.x - anchor.x, this.#ndc.y - anchor.y) > HOLE_STRETCH_DRAG;
+      if (!bothOnHole && !pulled) return;
+
+      this.#stretch = { active: true, baseline: 0, factor: 1, warned: { explode: false, void: false } };
+      this.#stretchLost = 0;
+      this.#spaceHold = null;
+      this.#orbit.setSuspended(true);
+      if (!this.#graph.hole.alive) {
+        this.#graph.hole.open(this.#holeAnchorPoint(), this.#graph.hole.radius || 5);
+      }
+      this.#graph.hole.hold(true);
+      this.#ctx.toast(
+        'info',
+        'Чёрная дыра растягивается! Разведите руки: немного — схлопнется и вернёт орбы, сильнее — ' +
+          'взорвётся, на максимуме — поглотит всё. Отпустите, когда решите.',
+      );
+    }
+
+    // Растяжение: двумя руками — расстояние между щипками, одной/мышью — путь от точки захвата.
+    let handsNow = false;
+    if (twoHands) {
+      const distance = Math.hypot(
+        gesture.cursor.ndcX - gesture.secondaryCursor.ndcX,
+        gesture.cursor.ndcY - gesture.secondaryCursor.ndcY,
+      );
+      if (this.#stretch.baseline === 0) this.#stretch.baseline = Math.max(0.08, distance);
+      this.#stretch.factor = distance / this.#stretch.baseline;
+      handsNow = true;
+    } else if (this.#holePull.active || pointer.pressed) {
+      const anchor = this.#holePull.pointerStart ?? this.#dragStartNdc;
+      const travel = Math.hypot(this.#ndc.x - anchor.x, this.#ndc.y - anchor.y);
+      this.#stretch.factor = 1 + Math.max(0, travel - HOLE_STRETCH_DRAG) / HOLE_STRETCH_PER_NDC;
+    }
+
+    const factor = Math.max(1, this.#stretch.factor);
+    this.#stretch.factor = factor;
+    this.#graph.hole.setStretch(factor);
+    // Дыру взяли тянуть — вытаскивание орба в этот раз отменяется (жест занят растяжением).
+    if (this.#holePull.node === null) this.#holePull.t = 0;
+
+    // Растянутая дыра ест всё, что попало за горизонт событий: это и есть «всё поглотит».
+    const eaten = this.#graph.absorbNearby(this.#graph.hole.radius * 1.05);
+    if (eaten.length > 0) this.#graph.sync(this.#connections);
+
+    const voidEnabled = this.#ctx.prefs.get().holeVoid;
+    const outcome = holeOutcome(factor, voidEnabled);
+    if (outcome !== 'collapse' && !this.#stretch.warned.explode) {
+      this.#stretch.warned.explode = true;
+      this.#ctx.toast('warn', 'Ещё немного — и дыра взорвётся: орбы разлетятся по сцене');
+    }
+    if (outcome === 'void' && !this.#stretch.warned.void) {
+      this.#stretch.warned.void = true;
+      this.#ctx.toast(
+        'error',
+        'ОПАСНО: на таком размере дыра поглотит всё, и приложение закроется. Отпустите сейчас — или тяните до конца',
+      );
+    }
+    this.#updateDiagnostics();
+
+    // Отпускание: руки разжались или указатель отпущен. Кисть на миг теряется — ждём 0.3 с.
+    const held = handsNow || this.#holePull.active || pointer.pressed;
+    this.#stretchLost = held ? 0 : this.#stretchLost + dt;
+    if (!held && this.#stretchLost > 0.3) this.#finishStretch();
+  }
+
+  /**
+   * Две руки разом: одна держит орб, вторая щипнула чёрную дыру — орб уходит за горизонт
+   * без рывка кистью. Раньше это приходилось делать броском; теперь достаточно показать
+   * дыре, что с орбом делать.
+   */
+  #updateHandOver(): void {
+    const gesture = this.#ctx.gesture.state;
+    const node = this.#graph.dragged;
+    // Орб должен быть в первой руке, а не в той, что уже что-то держит, и не на глобусе.
+    if (!node || node === this.#second.node || this.#globeActive) return;
+    if (!gesture.secondaryPinch || !gesture.secondaryCursor.active) return;
+    if (
+      !this.#graph.hitHole(
+        this.camera,
+        gesture.secondaryCursor.ndcX,
+        gesture.secondaryCursor.ndcY,
+        0.06,
+      )
+    ) {
+      return;
+    }
+
+    const toHole = this.#tempVec2
+      .copy(this.#graph.hole.object.position)
+      .applyMatrix4(this.#graph.object.matrixWorld)
+      .sub(this.#graph.nodeWorld(node, this.#tempVec));
+    const distance = Math.max(1e-3, toHole.length());
+    toHole.multiplyScalar((THROW_SPEED_MIN * 1.6) / distance);
+    if (!this.#graph.throwNode(node, toHole)) return;
+    this.#releaseSecond(true);
+    this.#releaseDrag();
+    this.#ctx.toast('info', `«${node.label}» ушёл в чёрную дыру: вторая рука указала, куда его`);
+  }
+
+  /** Где сейчас дыра в мировых координатах (для повторного раскрытия). */
+  #holeAnchorPoint(): THREE.Vector3 {
+    return this.#tempVec2.copy(this.#graph.hole.object.position).applyMatrix4(this.#graph.object.matrixWorld);
+  }
+
+  /** Отпустили растянутую дыру: схлопываем, взрываем или поглощаем всё. */
+  #finishStretch(): void {
+    if (!this.#stretch.active) return;
+    const factor = this.#stretch.factor;
+    const voidEnabled = this.#ctx.prefs.get().holeVoid;
+    const outcome = holeOutcome(factor, voidEnabled);
+    this.#stretch = { active: false, baseline: 0, factor: 1, warned: { explode: false, void: false } };
+    this.#stretchLost = 0;
+    if (!this.#dragging) this.#orbit.setSuspended(false);
+    this.#graph.hole.setStretch(1);
+
+    if (outcome === 'collapse') {
+      const returned = this.#graph.ejectAll(0);
+      this.#graph.hole.close();
+      this.#graph.sync(this.#connections);
+      this.#updateDiagnostics();
+      this.#renderPanel();
+      this.#ctx.toast(
+        'info',
+        returned.length
+          ? `Дыра схлопнулась и вернула орбы: ${returned.length}`
+          : 'Дыра схлопнулась: внутри ничего не было',
+      );
+      return;
+    }
+
+    if (outcome === 'explode') {
+      const blown = this.#graph.ejectAll(HOLE_EJECT_SPEED);
+      this.#graph.hole.explode();
+      this.#graph.sync(this.#connections);
+      this.#updateDiagnostics();
+      this.#renderPanel();
+      this.#ctx.toast(
+        'info',
+        `Дыра взорвалась: орбы (${blown.length}) разлетелись по сцене и остались там, где остановились`,
+      );
+      return;
+    }
+
+    // Крайний исход: поглощает всё, что осталось, и приложение закрывается (или сцена
+    // перезапускается в браузере — там окно закрыть нельзя).
+    this.#graph.absorbEverything();
+    this.#graph.hole.explode();
+    this.#updateDiagnostics();
+    this.#beginVoid();
+  }
+
+  /**
+   * «Всё поглощено»: сцена уходит в темноту, а дальше — либо закрытие приложения
+   * (Tauri), либо кнопка «Начать заново» в браузере. Это необратимо, поэтому решение
+   * принимает пользователь растяжением, а не случайный жест.
+   */
+  #beginVoid(): void {
+    if (!this.#void) {
+      const overlay = document.createElement('div');
+      overlay.style.cssText =
+        'position:fixed;inset:0;background:#000;opacity:0;transition:opacity 1.6s ease;' +
+        'z-index:60;display:flex;flex-direction:column;align-items:center;justify-content:center;' +
+        'gap:18px;font-family:var(--font-mono,monospace);color:#ffd9a0;text-align:center;pointer-events:none';
+      const title = document.createElement('div');
+      title.style.cssText = 'font-size:22px;letter-spacing:0.22em;text-transform:uppercase';
+      title.textContent = 'Чёрная дыра поглотила всё';
+      const note = document.createElement('div');
+      note.style.cssText = 'font-size:13px;color:#9a8fb0';
+      note.textContent = 'соединения, процессы и хосты ушли за горизонт событий';
+      const restart = document.createElement('button');
+      restart.className = 'hud-btn';
+      restart.style.pointerEvents = 'auto';
+      restart.textContent = 'Начать заново';
+      restart.addEventListener('click', () => window.location.reload());
+      overlay.append(title, note, restart);
+      document.body.appendChild(overlay);
+      this.#void = overlay;
+    }
+    const overlay = this.#void;
+    requestAnimationFrame(() => {
+      overlay.style.opacity = '1';
+      overlay.style.pointerEvents = 'auto';
+    });
+
+    // В приложении окно действительно закрывается: сначала даём сцене уйти в темноту.
+    window.setTimeout(() => {
+      void invoke('app_quit').catch((err) => console.warn('[network] закрытие приложения:', err));
+    }, 2600);
+  }
+
   #onPointerClick(): void {
     if (this.#dragging) return;
     // В режиме передачи короткий щипок/клик не выбирает узел, а назначает отдающего и приёмника.
-    if (this.#transferMode && this.#transferPick(this.#globeActive ? null : this.#hovered)) return;
+    if (this.#pointMode && this.#transferPick(this.#globeActive ? null : this.#hovered)) return;
     if (this.#globeActive || !this.#hovered) {
       this.#selected = null;
       this.#renderPanel();
@@ -1384,6 +1694,16 @@ export class NetworkScene implements SceneModule {
     returnRow.appendChild(transferButton);
     this.#transferButton = transferButton;
 
+    // Слияние орбов: процессы (или хосты) становятся одним орбом с общими подключениями.
+    const mergeButton = document.createElement('button');
+    mergeButton.className = 'hud-btn';
+    mergeButton.dataset.action = 'merge';
+    mergeButton.textContent = 'Слить орбы';
+    mergeButton.title = 'Режим слияния: щёлкните орб, который растворится, затем того, в кого сливать (Y)';
+    mergeButton.addEventListener('click', () => this.#toggleMergeMode());
+    returnRow.appendChild(mergeButton);
+    this.#mergeButton = mergeButton;
+
     const collapseButton = document.createElement('button');
     collapseButton.className = 'hud-btn';
     collapseButton.textContent = 'Сложить сцену';
@@ -1436,8 +1756,13 @@ export class NetworkScene implements SceneModule {
     if (handed) parts.push(`связи у соседей: ${handed}`);
     const rewired = this.#graph.rewireCount;
     if (rewired) parts.push(`передано руками: ${rewired}`);
-    if (this.#transferMode) {
-      parts.push(this.#transferSource ? `передача: отдаёт «${this.#transferSource.label}»` : 'режим передачи');
+    if (this.#pointMode) {
+      const what = this.#pointMode === 'merge' ? 'слияние' : 'передача';
+      parts.push(this.#transferSource ? `${what}: «${this.#transferSource.label}»` : `режим ${what}`);
+    }
+    if (this.#stretch.active) {
+      const outcome = holeOutcome(this.#stretch.factor, this.#ctx.prefs.get().holeVoid);
+      parts.push(`дыра ${Math.round(this.#stretch.factor * 100)}% — ${holeOutcomeLabel(outcome)}`);
     }
     if (inHole) parts.push(`в чёрной дыре: ${inHole}`);
     if (scale !== 100) parts.push(`сцена ${scale}%`);
@@ -1486,13 +1811,18 @@ export class NetworkScene implements SceneModule {
           })()
         }
         ${
-          this.#transferMode
+          this.#pointMode
             ? this.#transferSource
-              ? `<div class="hud-label" style="margin-top:6px">режим передачи · отдаёт «${escapeHtml(this.#transferSource.label)}» · щёлкните орб того же типа, который примет</div>`
-              : '<div class="hud-label" style="margin-top:6px">режим передачи · щёлкните орб, у которого забрать подключения</div>'
+              ? `<div class="hud-label" style="margin-top:6px">режим ${this.#pointMode === 'merge' ? 'слияния' : 'передачи'} · выбран «${escapeHtml(this.#transferSource.label)}» · щёлкните орб того же типа, ${this.#pointMode === 'merge' ? 'в который слить' : 'который примет'}</div>`
+              : `<div class="hud-label" style="margin-top:6px">режим ${this.#pointMode === 'merge' ? 'слияния' : 'передачи'} · щёлкните орб, ${this.#pointMode === 'merge' ? 'который растворится' : 'у которого забрать подключения'}</div>`
             : pinned
-              ? '<div class="hud-label" style="margin-top:6px">орб в руке/оставлен · отпустите его НА другом орбе — подключения перейдут тому; «Вернуть узлы» возвращает всё</div>'
-              : '<div class="hud-label" style="margin-top:6px">щипок — вырвать; рывок при отпускании — в чёрную дыру; режим «Передать подключения» — щёлкни отдающий орб, затем приёмник</div>'
+              ? '<div class="hud-label" style="margin-top:6px">орб в руке/оставлен · «Вернуть узлы» возвращает всё</div>'
+              : '<div class="hud-label" style="margin-top:6px">щипок — вырвать; T — передать подключения, Y — слить орбы; свести два орба двумя руками — слияние</div>'
+        }
+        ${
+          node.mergedFrom?.length
+            ? `<div class="hud-label" style="margin-top:6px">вобрал в себя: ${escapeHtml(node.mergedFrom.join(', '))}</div>`
+            : ''
         }`;
       const list = document.createElement('div');
       list.className = 'hud-group';
@@ -1530,8 +1860,12 @@ export class NetworkScene implements SceneModule {
         'Руки: щипок по орбу — вырвать (его подключения заберёт сосед); рывок кистью при отпускании — ' +
         'бросок в чёрную дыру; щипок по чёрной дыре — она раскроется и отдаст орб; щипок в пустоте — ' +
         'вращение и наклон сцены; свести/развести две руки — сложить всю сцену в ладонь и развернуть; ' +
-        'вторая рука щипком — второй орб. Передать подключения: кнопка «Передать подключения» (или T) — ' +
-        'щипните отдающий орб, затем приёмник. Перетаскивание орба на орб тоже работает.';
+        'вторая рука щипком — второй орб сразу. Обе руки на дыре: разведите — дыра растянется, и по силе ' +
+        'растяжения отпускание либо схлопнёт её с возвратом орбов, либо взорвёт, либо (на максимуме) она ' +
+        'поглотит всё и приложение закроется. Свести два орба двумя руками — слить их в один. Одна рука ' +
+        'держит орб, вторая щипнула дыру — орб уходит за горизонт без броска. Передать подключения: ' +
+        'кнопка «Передать подключения» (или T) — щипните отдающий орб, затем приёмник; слияние — ' +
+        'кнопка «Слить орбы» (или Y). Перетаскивание орба на орб тоже работает.';
       body.appendChild(hands);
 
       const hint = document.createElement('div');

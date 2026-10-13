@@ -55,6 +55,11 @@ export interface Prefs {
    * (обычная и ИК для Windows Hello), и если система отдаёт вторую, рук в кадре не будет.
    */
   handCameraId: string;
+  /**
+   * Разрешить растянутой чёрной дыре доходить до крайнего исхода: поглотить всё
+   * и закрыть приложение. Выключено — на максимуме дыра просто взрывается.
+   */
+  holeVoid: boolean;
   /** Усиление движения: рукой в воздухе можно управлять всем экраном. */
   handSensitivity: number;
   /** Сглаживание курсора 0…0.95 (One Euro Filter). */
@@ -107,6 +112,7 @@ export const DEFAULT_PREFS: Prefs = {
   handShowSkeleton: true,
   handShowPreview: false,
   handCameraId: '',
+  holeVoid: true,
   handSensitivity: 1.2,
   handSmoothing: 0.55,
   handPauseGesture: false,

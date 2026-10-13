@@ -10,3 +10,11 @@ use crate::state::AppState;
 pub fn sys_info(state: State<'_, AppState>) -> Result<SysInfoPayload> {
     Ok(state.sys.clone())
 }
+
+/// Выход из приложения. Зовётся из сцены сети: растянутая до предела чёрная дыра
+/// поглощает всё, и это последний шаг — закрыть окно. В браузере (dev-режим) команды
+/// нет, поэтому фронтенд ловит ошибку и предлагает перезапуск сцены.
+#[tauri::command]
+pub fn app_quit(app: tauri::AppHandle) {
+    app.exit(0);
+}

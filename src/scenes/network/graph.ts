@@ -27,6 +27,29 @@ import { BlackHole } from './blackHole';
 
 export type NodeKind = 'local' | 'process' | 'remote';
 
+/**
+ * Растянутая двумя руками чёрная дыра. Чем сильнее растянули, тем серьёзнее исход:
+ * ниже порога взрыва — дыра просто схлопывается и отдаёт орбы, дальше — взрывается,
+ * а за порогом «всего» (если включён опасный режим) — поглощает всё и приложение закрывается.
+ */
+export const HOLE_STRETCH_EXPLODE = 1.45;
+export const HOLE_STRETCH_VOID = 2.6;
+
+/** Что случится, если отпустить растянутую дыру. Чистая функция — удобно проверять. */
+export function holeOutcome(factor: number, voidEnabled = true): 'collapse' | 'explode' | 'void' {
+  if (voidEnabled && factor >= HOLE_STRETCH_VOID) return 'void';
+  if (factor >= HOLE_STRETCH_EXPLODE) return 'explode';
+  return 'collapse';
+}
+
+/** Человеческая подпись исхода — ею пользуются сцена и подсказки. */
+export function holeOutcomeLabel(outcome: 'collapse' | 'explode' | 'void'): string {
+  return outcome === 'collapse' ? 'схлопнется и вернёт орбы' : outcome === 'explode' ? 'взорвётся' : 'поглотит всё';
+}
+
+/** С какой скоростью разлетаются орбы при взрыве дыры (мировые единицы в секунду). */
+export const HOLE_EJECT_SPEED = 130;
+
 export interface GraphNode {
   id: string;
   kind: NodeKind;
@@ -71,6 +94,10 @@ export interface GraphNode {
   throwT?: number;
   /** 0..1 — насколько узел уже поглощён (анимация схлопывания в точку). */
   devour?: number;
+  /** Кого в себя вобрал этот орб (для панели): «слито: node, chrome». */
+  mergedFrom?: string[];
+  /** Выброс из дыры: узел отлетает по инерции и закрепляется там, где остановился. */
+  eject?: { vx: number; vy: number; vz: number };
 }
 
 export interface GraphLink {
@@ -185,6 +212,8 @@ export class ForceGraph {
   #swallowed = new Set<string>();
   /** Идентификаторы разорванных связей: синхронизация их больше не создаёт. */
   #severed = new Set<string>();
+  /** Кто в кого слит: узел исчез из сцены, его подключения ушли соседу. */
+  #merged = new Map<string, string>();
   /**
    * Подстановка узлов: связи вырванного орба переходят соседу. `было → стало`,
    * поэтому синхронизация собирает граф уже с новым владельцем связей, а сам
@@ -198,10 +227,15 @@ export class ForceGraph {
    * чтобы кнопка «Обратно» вернула всё ровно как было (и в ту, и в другую сторону).
    */
   #rewireLog: {
+    kind: 'rewire' | 'merge';
     fromId: string;
     toId: string;
     links: string[];
     owners: [string, string | undefined][];
+    /** Для слияния: исчезнувший узел, чтобы «Обратно» вернуло его в сцену. */
+    node?: GraphNode;
+    /** Связи, которые слияние разорвало (их «Обратно» оживляет заново). */
+    severed?: string[];
   }[] = [];
   /** Орб, который примет подключения, если отпустить здесь (подсвечивается). */
   #dropTarget: GraphNode | null = null;
@@ -705,6 +739,8 @@ export class ForceGraph {
       node.boost = boost + (boostTarget - boost) * Math.min(1, dt * (boostTarget > boost ? 7 : 4));
       // Выкинутый орб: летит сам и заворачивает к чёрной дыре.
       if (node.thrown) this.#flyToHole(node, dt);
+      // Выброшенный дырой орб: отлетает по инерции и останавливается там, где затих.
+      if (node.eject) this.#flyOff(node, dt);
       // Поглощение: узел сжимается в точку за горизонтом событий.
       if (node.devour !== undefined) this.#devourStep(node, dt);
     }
@@ -1093,9 +1129,9 @@ export class ForceGraph {
    * подстановка соседу снимается, разорванные связи оживают, и ближайшая синхронизация
    * собирает их заново. Возвращает узел, чтобы сцена взяла его в руку.
    */
-  extractOrb(): GraphNode | null {
+  extractOrb(only?: string): GraphNode | null {
     if (this.#dumps.size === 0) return null;
-    const keys = [...this.#dumps.keys()];
+    const keys = only && this.#dumps.has(only) ? [only] : [...this.#dumps.keys()];
     const key = keys[Math.floor(Math.random() * keys.length)];
     const dump = this.#dumps.get(key);
     if (!dump) return null;
@@ -1146,6 +1182,76 @@ export class ForceGraph {
 
   get hole(): BlackHole {
     return this.#hole;
+  }
+
+  /**
+   * Отдать наружу ВСЁ, что лежит в дыре. `speed > 0` — орбы вылетают веером в стороны
+   * (взрыв дыры), `speed = 0` — просто возвращаются в сцену вокруг неё (схлопывание).
+   * Возвращает вернувшиеся узлы: сцена берёт последний в руку, если хочется.
+   */
+  ejectAll(speed = 0): GraphNode[] {
+    const out: GraphNode[] = [];
+    const at = this.#hole.object.position;
+    for (const key of [...this.#dumps.keys()]) {
+      const node = this.extractOrb(key);
+      if (!node) continue;
+      if (speed > 0) {
+        // Направление веером: от дыры наружу, с разбросом по всем осям.
+        const angle = Math.random() * Math.PI * 2;
+        const lift = (Math.random() - 0.5) * 0.9;
+        const vx = Math.cos(angle);
+        const vz = Math.sin(angle);
+        const length = Math.hypot(vx, vz) || 1;
+        node.eject = {
+          vx: (vx / length) * speed * (0.6 + Math.random() * 0.7),
+          vy: lift * speed * 0.6,
+          vz: (vz / length) * speed * (0.6 + Math.random() * 0.7),
+        };
+      } else {
+        // Тихий возврат: орб просто оказывается рядом с дырой.
+        node.x = (at.x ?? 0) + (Math.random() - 0.5) * 14;
+        node.y = (at.y ?? 0) + (Math.random() - 0.5) * 10;
+        node.z = (at.z ?? 0) + (Math.random() - 0.5) * 14;
+      }
+      out.push(node);
+    }
+    return out;
+  }
+
+  /**
+   * Растянутая дыра ест всё, что попало за горизонт событий. Возвращает проглоченных —
+   * сцена может сказать об этом вслух.
+   */
+  absorbNearby(radius: number): GraphNode[] {
+    const absorbed: GraphNode[] = [];
+    const at = this.#hole.object.position;
+    for (const node of [...this.nodes]) {
+      if (node.kind === 'local' || node.devour !== undefined || node.thrown) continue;
+      if (this.#grabbed.includes(node)) continue;
+      const distance = Math.hypot(
+        (node.x ?? 0) - at.x,
+        (node.y ?? 0) - at.y,
+        (node.z ?? 0) - at.z,
+      );
+      if (distance > radius) continue;
+      this.#startDevour(node);
+      absorbed.push(node);
+    }
+    return absorbed;
+  }
+
+  /**
+   * Поглотить всё разом (исход «дыра всё поглотила»). Машину не трогаем: она центр сцены,
+   * и пока идёт затемнение, её судьба уже не важна.
+   */
+  absorbEverything(): number {
+    let count = 0;
+    for (const node of [...this.nodes]) {
+      if (node.kind === 'local' || node.devour !== undefined || node.thrown) continue;
+      this.#startDevour(node);
+      count++;
+    }
+    return count;
   }
 
   /**
@@ -1254,6 +1360,27 @@ export class ForceGraph {
     node.fz = node.z;
     node.spin = (node.spin ?? 0) + dt * 7;
     if (distance < this.#hole.radius * 0.85) this.#startDevour(node);
+  }
+
+  /**
+   * Полёт выброшенного из дыры орба: тормозит о «пространство» и закрепляется там, где
+   * остановился, — найденный при взрыве орб остаётся в сцене, а не улетает в пустоту.
+   */
+  #flyOff(node: GraphNode, dt: number): void {
+    const eject = node.eject;
+    if (!eject) return;
+    node.x = (node.x ?? 0) + eject.vx * dt;
+    node.y = (node.y ?? 0) + eject.vy * dt;
+    node.z = (node.z ?? 0) + eject.vz * dt;
+    const damping = Math.exp(-dt * 1.7);
+    eject.vx *= damping;
+    eject.vy = eject.vy * damping + 3 * dt;
+    eject.vz *= damping;
+    node.fx = node.x;
+    node.fy = node.y;
+    node.fz = node.z;
+    node.spin = (node.spin ?? 0) + dt * 4;
+    if (Math.hypot(eject.vx, eject.vy, eject.vz) < 3.5) node.eject = undefined;
   }
 
   /** Узел у горизонта событий: связи рвутся, узел схлопывается в точку. */
@@ -1366,10 +1493,21 @@ export class ForceGraph {
    * хост ↔ хост), не «эта машина», не поглощённые и не занятые другой рукой.
    */
   canRewire(from: GraphNode | null, to: GraphNode | null): boolean {
+    // В приёмники не берём того, кого сейчас держат в руке: орб в руке — ещё не цель.
+    return this.#compatible(from, to) && !this.#grabbed.includes(to!);
+  }
+
+  /**
+   * Могут ли эти двое вообще делиться подключениями: оба живые и в сцене, одного типа
+   * (процесс ↔ процесс, хост ↔ хост), и ни один не «эта машина».
+   */
+  #compatible(from: GraphNode | null, to: GraphNode | null): boolean {
     if (!from || !to || from === to) return false;
+    // Только живые орбы: слитый (или проглоченный) со сцены ушёл — передавать ему нечего.
+    if (!this.nodes.includes(from) || !this.nodes.includes(to)) return false;
     if (from.kind !== to.kind || from.kind === 'local') return false;
     if (from.devour !== undefined || to.devour !== undefined) return false;
-    return !this.#grabbed.includes(to);
+    return true;
   }
 
   /** Орб, который примет подключения, если отпустить указатель здесь. */
@@ -1436,9 +1574,32 @@ export class ForceGraph {
    * никуда не делся, переехали только его подключения.
    */
   rewire(from: GraphNode, to: GraphNode): { moved: number; connections: NetConnection[] } | null {
-    // Меняться подключениями могут орбы одного типа (процесс ↔ процесс, хост ↔ хост)
-    // и не «эта машина»: смешивать типы — значит получить бессмысленную сцену.
+    // Меняться подключениями могут орбы одного типа, и приёмник должен быть свободен.
     if (!this.canRewire(from, to)) return null;
+    const hand = this.#handOver(from, to);
+    if (!hand) return null;
+    this.#rewireLog.push({
+      kind: 'rewire',
+      fromId: from.id,
+      toId: to.id,
+      links: hand.links,
+      owners: hand.owners,
+    });
+    this.#refreshLinks();
+    return { moved: hand.links.length, connections: hand.connections };
+  }
+
+  /**
+   * Общий шаг передачи владения: линии уходят от `from` к `to` (с перелётом), подстановка
+   * «кто теперь владелец» запоминается — и для передачи, и для слияния она одна и та же.
+   */
+  #handOver(
+    from: GraphNode,
+    to: GraphNode,
+  ): { links: string[]; connections: NetConnection[]; owners: [string, string | undefined][] } | null {
+    // Совместимость проверяем и здесь: мимо неё подключения не переходят ни при передаче,
+    // ни при слиянии — это единственная точка, где меняется владелец связи.
+    if (!this.#compatible(from, to)) return null;
     const movedIds: string[] = [];
     const connections: NetConnection[] = [];
     for (const link of [...this.links]) {
@@ -1462,9 +1623,67 @@ export class ForceGraph {
       if (key === to.id) this.#substitutes.delete(key);
       else this.#substitutes.set(key, to.id);
     }
-    this.#rewireLog.push({ fromId: from.id, toId: to.id, links: movedIds, owners });
+    return { links: movedIds, connections, owners };
+  }
+
+  /**
+   * Сливаться могут орбы одного типа: процесс с процессом, хост с хостом. В отличие от
+   * передачи подключений, в руке может быть и приёмник — двумя руками как раз и сводят орбы.
+   */
+  canMerge(from: GraphNode | null, to: GraphNode | null): boolean {
+    return this.#compatible(from, to);
+  }
+
+  /**
+   * Слить два орба в один: «это теперь один процесс». Подключения исчезающего орба
+   * перелетают к оставшемуся, сам он растворяется в нём и покидает сцену (а синхронизация
+   * больше его не создаёт — id разрешается в выжившего). Слияние обратимо: «Обратно»
+   * возвращает орб в сцену вместе с его подключениями.
+   */
+  merge(from: GraphNode, to: GraphNode): { moved: number; label: string } | null {
+    if (!this.canMerge(from, to)) return null;
+    const hand = this.#handOver(from, to);
+    if (!hand) return null;
+
+    this.#forgetGrabbed(from);
+    const index = this.nodes.indexOf(from);
+    if (index >= 0) this.nodes.splice(index, 1);
+    this.#byId.delete(from.id);
+    this.#merged.set(from.id, to.id);
+
+    // Что не переехало (связь с машиной, дубли к тому же орбу) — убираем, иначе осталась бы
+    // висеть линия в никуда. Эти связи запоминаем: «Обратно» их оживит вместе с узлом.
+    const severed: string[] = [];
+    for (const link of [...this.links]) {
+      if (link.source !== from && link.target !== from) continue;
+      severed.push(link.id);
+      this.#severed.add(link.id);
+      const at = this.links.indexOf(link);
+      if (at >= 0) this.links.splice(at, 1);
+    }
+    to.mergedFrom = [...(to.mergedFrom ?? []), from.label];
+    // Слитый орб выглядит крупнее: в нём теперь несколько процессов.
+    to.boostTarget = Math.max(to.boostTarget ?? 0, Math.min(2, to.mergedFrom.length * 0.5));
+    this.#rewireLog.push({
+      kind: 'merge',
+      fromId: from.id,
+      toId: to.id,
+      links: hand.links,
+      owners: hand.owners,
+      node: from,
+      severed,
+    });
+    for (const node of this.nodes) {
+      node.degree = this.links.filter((link) => link.source === node || link.target === node).length;
+    }
     this.#refreshLinks();
-    return { moved: movedIds.length, connections };
+    this.#rebuildInstances();
+    return { moved: hand.links.length, label: from.label };
+  }
+
+  /** Сколько слияний сделано руками (для панели сцены). */
+  get mergeCount(): number {
+    return this.#merged.size;
   }
 
   /**
@@ -1479,6 +1698,24 @@ export class ForceGraph {
     for (const [key, before] of record.owners) {
       if (before === undefined) this.#substitutes.delete(key);
       else this.#substitutes.set(key, before);
+    }
+
+    // Слияние отменяем вместе с узлом: он возвращается в сцену и забирает свои подключения.
+    if (record.kind === 'merge' && record.node) {
+      const restored = record.node;
+      this.#merged.delete(restored.id);
+      // Оживляем разорванные слиянием связи: их снова соберёт ближайшая синхронизация.
+      for (const id of record.severed ?? []) this.#severed.delete(id);
+      if (to?.mergedFrom) to.mergedFrom = to.mergedFrom.filter((label) => label !== restored.label);
+      if (to) to.boostTarget = Math.min(2, (to.mergedFrom?.length ?? 0) * 0.5);
+      if (!this.nodes.includes(restored)) {
+        // Появляется на месте того, кто его вобрал, — рядом и заметно.
+        restored.x = (to?.x ?? 0) + 6;
+        restored.y = (to?.y ?? 0) - 6;
+        restored.z = (to?.z ?? 0) + 6;
+        this.nodes.push(restored);
+      }
+      this.#byId.set(restored.id, restored);
     }
 
     if (from && to) {
@@ -1508,6 +1745,8 @@ export class ForceGraph {
       node.thrown = undefined;
       node.throwT = undefined;
       node.devour = undefined;
+      node.eject = undefined;
+      node.mergedFrom = undefined;
     }
     this.#grabbed.length = 0;
     this.#dropTarget = null;
@@ -1521,6 +1760,7 @@ export class ForceGraph {
     this.#severed.clear();
     this.#substitutes.clear();
     this.#dumps.clear();
+    this.#merged.clear();
     this.#devouredCount = 0;
     for (let i = this.links.length - 1; i >= 0; i--) {
       if (this.links[i].cutT !== undefined) this.links.splice(i, 1);

@@ -29,6 +29,14 @@ export function installMockBackend(): void {
 /* ─────────────────────────── Система ─────────────────────────── */
 
 function installSystem(): void {
+  // Вне Tauri окно закрыть нельзя: «выход» из приложения превращаем в перезапуск страницы —
+  // это честный эквивалент, и вызов из сцены остаётся единым для обеих сред.
+  mockCommand('app_quit', () => {
+    console.info('[mock] app_quit: перезапускаю страницу (в приложении Tauri здесь закрылось бы окно)');
+    window.setTimeout(() => window.location.reload(), 400);
+    return null;
+  });
+
   mockCommand('sys_info', () => ({
     os: 'демо-режим (браузер)',
     elevated: false,

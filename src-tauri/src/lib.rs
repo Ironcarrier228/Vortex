@@ -26,6 +26,7 @@ pub fn run() {
         .manage(state::AppState::new())
         .invoke_handler(tauri::generate_handler![
             commands::system::sys_info,
+            commands::system::app_quit,
             commands::audio::audio_start,
             commands::audio::audio_set_active,
             commands::audio::audio_stop,

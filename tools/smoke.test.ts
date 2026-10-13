@@ -33,7 +33,16 @@ import { economyRate } from '../src/core/gesture/rate';
 import { frameInfo, hintForStatus, pinchText } from '../src/core/gesture';
 import { CameraStepError, describeError, isTransientCameraError } from '../src/core/gesture/handTracker';
 import * as THREE from 'three';
-import { ForceGraph } from '../src/scenes/network/graph';
+import {
+  ForceGraph,
+  HOLE_EJECT_SPEED,
+  HOLE_STRETCH_EXPLODE,
+  HOLE_STRETCH_VOID,
+  holeOutcome,
+  holeOutcomeLabel,
+} from '../src/scenes/network/graph';
+import { HOLE_STRETCH_MAX } from '../src/scenes/network/blackHole';
+import { DEFAULT_PREFS } from '../src/core/prefs';
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { runInThisContext } from 'node:vm';
@@ -929,6 +938,172 @@ async function main(): Promise<void> {
       !isTransientCameraError(new DOMException('', 'OverconstrainedError')),
     'запрет доступа и отсутствие камеры повторами не лечатся — не пытаемся',
   );
+
+  // ── Растянутая чёрная дыра: три исхода ──
+  console.log('Сеть: растянутая чёрная дыра — схлопнется, взорвётся или поглотит всё');
+  // Пороги: слабо потянули — вернёт орбы, сильнее — взорвётся, на максимуме — поглотит всё.
+  check(
+    holeOutcome(1) === 'collapse' && holeOutcome(HOLE_STRETCH_EXPLODE - 0.01) === 'collapse',
+    'слабое растяжение — дыра просто схлопнется и вернёт орбы',
+  );
+  check(
+    holeOutcome(HOLE_STRETCH_EXPLODE) === 'explode' && holeOutcome(HOLE_STRETCH_VOID - 0.01) === 'explode',
+    'среднее растяжение — дыра взорвётся',
+  );
+  check(
+    holeOutcome(HOLE_STRETCH_VOID) === 'void' && holeOutcome(HOLE_STRETCH_VOID * 4) === 'void',
+    'перетянутая дыра поглотит всё',
+  );
+  check(
+    holeOutcome(HOLE_STRETCH_VOID, false) === 'explode',
+    'с выключенным «поглотить всё» дальше взрыва дело не идёт — приложение не закрывается',
+  );
+  check(
+    holeOutcomeLabel('collapse').includes('схлопнется') &&
+      holeOutcomeLabel('explode').includes('взорв') &&
+      holeOutcomeLabel('void').includes('поглотит'),
+    'каждый исход называется человеческими словами',
+  );
+  check(
+    DEFAULT_PREFS.holeVoid === true,
+    'по умолчанию крайний исход разрешён (тумблер «поглотить всё» включён)',
+  );
+
+  // Растяжение живой дыры: она реально крупнее и не превышает максимум.
+  const stretched = new ForceGraph();
+  stretched.sync(inspectConnections);
+  stretched.hole.open(new THREE.Vector3(0, 0, 0), 5);
+  stretched.hole.hold(true);
+  check(stretched.hole.held && stretched.hole.alive, 'дыру раскрыли, чтобы растянуть');
+  for (let frame = 0; frame < 240; frame++) stretched.update(1 / 60, frame / 60, null);
+  const calmRadius = stretched.hole.radius;
+  stretched.hole.setStretch(2);
+  check(Math.abs(stretched.hole.stretch - 2) < 1e-6, 'растяжение 2× применилось');
+  for (let frame = 0; frame < 240; frame++) stretched.update(1 / 60, 5 + frame / 60, null);
+  const wideRadius = stretched.hole.radius;
+  check(
+    wideRadius > calmRadius * 1.5,
+    `растянутая дыра заметно крупнее (${wideRadius.toFixed(2)} против ${calmRadius.toFixed(2)})`,
+  );
+  stretched.hole.setStretch(HOLE_STRETCH_MAX + 5);
+  check(stretched.hole.stretch === HOLE_STRETCH_MAX, 'растяжение ограничено максимумом');
+  stretched.hole.setStretch(0.2);
+  check(stretched.hole.stretch === 1, 'сжать дыру меньше обычного нельзя');
+
+  // Растянутая дыра ест всё, что попало за горизонт событий.
+  const eater = new ForceGraph();
+  eater.sync(inspectConnections);
+  eater.hole.open(new THREE.Vector3(0, 0, 0), 6);
+  eater.hole.hold(true);
+  const near = eater.nodes.filter(
+    (node) => node.kind !== 'local' && Math.hypot(node.x ?? 0, node.y ?? 0, node.z ?? 0) < 6,
+  );
+  if (near.length > 0) {
+    const eatenNear = eater.absorbNearby(6);
+    check(eatenNear.length === near.length, `растянутая дыра съела тех, кто был рядом (${eatenNear.length})`);
+  } else {
+    check(eater.absorbNearby(6).length === 0, 'рядом никого — есть некого');
+  }
+  const total = eater.nodes.filter((node) => node.kind !== 'local' && node.devour === undefined).length;
+  const swallowed = eater.absorbEverything();
+  check(swallowed >= total, `исход «поглотит всё»: за горизонт ушло ${swallowed} орбов`);
+  check(
+    eater.nodes.every((node) => node.kind === 'local' || node.devour !== undefined),
+    'в сцене не осталось ни одного живого орба',
+  );
+  check(
+    eater.nodes.some((node) => node.kind === 'local'),
+    'машина остаётся на месте — это центр сцены',
+  );
+
+  // Взрыв: дыра выплюнула всех веером, и они остались там, где остановились.
+  const inHole = eater.dumpCount;
+  const blown = eater.ejectAll(HOLE_EJECT_SPEED);
+  check(
+    blown.length === inHole && inHole >= swallowed,
+    `взрыв вернул всех проглоченных (${blown.length} из ${inHole})`,
+  );
+  check(
+    blown.every((node) => (node.eject?.vx ?? 0) !== 0 || (node.eject?.vz ?? 0) !== 0),
+    'выброшенные орбы получили скорость — разлетаются, а не появляются на месте',
+  );
+  for (let frame = 0; frame < 600; frame++) eater.update(1 / 60, 20 + frame / 60, null);
+  check(
+    blown.every((node) => node.fx !== null && node.fy !== null),
+    'разлетевшиеся орбы закрепились там, где остановились',
+  );
+  check(eater.dumpCount === 0, 'после взрыва дыра пуста');
+  check(
+    eater.ejectAll(HOLE_EJECT_SPEED).length === 0,
+    'повторный взрыв ничего не добавляет — выбрасывать больше нечего',
+  );
+
+  // Схлопывание: те же орбы возвращаются тихо, рядом с дырой.
+  const quite = new ForceGraph();
+  quite.sync(inspectConnections);
+  quite.absorbEverything();
+  const returnedQuietly = quite.ejectAll(0);
+  check(returnedQuietly.length > 0, `схлопывание вернуло орбы (${returnedQuietly.length})`);
+  check(
+    returnedQuietly.every((node) => node.eject === undefined),
+    'при схлопывании орбы не разлетаются — они просто возвращаются в сцену',
+  );
+
+  // ── Слияние: два орба руками становятся одним, и это обратимо ──
+  console.log('Сеть: слияние орбов — два процесса становятся одним (и обратно)');
+  const merger = new ForceGraph();
+  merger.sync(inspectConnections);
+  const mergePair = merger.nodes.filter((node) => node.kind === 'remote');
+  check(mergePair.length >= 2, `есть кого сливать: процессов ${mergePair.length}`);
+  const beforeLinks = merger.connectionsOf(mergePair[1]).length;
+  const beforeCount = merger.nodes.length;
+  const merged = merger.merge(mergePair[0], mergePair[1]);
+  check(Boolean(merged), 'слияние состоялось');
+  check(merger.nodes.length === beforeCount - 1 && !merger.nodes.includes(mergePair[0]), 'исчезнувший орб ушёл со сцены');
+  check(merger.mergeCount === 1, 'сцена помнит про слияние');
+  check(
+    merger.nodes.every((node) => node !== mergePair[0] || merger.dragged === node) &&
+      merger.links.every((link) => link.source !== mergePair[0] && link.target !== mergePair[0]),
+    'на исчезнувшем орбе не осталось висящих линий',
+  );
+  const grown = merger.connectionsOf(mergePair[1]).length;
+  check(
+    grown > beforeLinks,
+    `подключения перешли к выжившему (${beforeLinks} → ${grown})`,
+  );
+  check(
+    (mergePair[1].mergedFrom ?? []).includes(mergePair[0].label),
+    'выживший помнит, кого вобрал',
+  );
+  const beforeMergeId = mergePair[0].id;
+  merger.sync(inspectConnections);
+  check(!merger.nodes.includes(mergePair[0]), 'новая синхронизация не оживляет слитый орб');
+  check(!merger.canMerge(mergePair[0], mergePair[1]), 'слить исчезнувший орб уже нельзя');
+  check(merger.undoRewire(), 'слияние отменяется');
+  check(
+    merger.nodes.some((node) => node.id === beforeMergeId),
+    '«Обратно» вернуло орб в сцену',
+  );
+  check(merger.mergeCount === 0, 'сцена снова не помнит про слияние');
+  check(
+    (mergePair[1].mergedFrom ?? []).length === 0,
+    'выживший больше не помнит про вобранный орб',
+  );
+  merger.sync(inspectConnections);
+  for (let frame = 0; frame < 200; frame++) merger.update(1 / 60, 60 + frame / 60, null);
+  const restoredLinks = merger.connectionsOf(mergePair[1]).length;
+  check(
+    Math.abs(restoredLinks - beforeLinks) <= 1,
+    `после отмены связи вернулись к прежнему числу (${beforeLinks} → ${restoredLinks})`,
+  );
+  check(
+    !merger.canMerge(mergePair[0], merger.nodes.find((node) => node.kind === 'local')!),
+    'сливать орб с машиной нельзя — это другой тип',
+  );
+  merger.dispose();
+  quite.dispose();
+  eater.dispose();
+  stretched.dispose();
 
   console.log('Жесты: экономный режим (общая частота с рендером)');
   // Модель и рендер делят один GPU: при просадке FPS распознавание реже, картинка плавнее.

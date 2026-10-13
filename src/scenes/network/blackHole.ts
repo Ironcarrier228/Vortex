@@ -22,6 +22,8 @@ const CLOSE_RATE = 3.2;
 const BURST_TIME = 0.5;
 /** Доля радиуса, до которой оседает дыра, когда внутри ещё что-то есть. */
 const IDLE_SCALE = 0.34;
+/** До какого размера дыру можно растянуть двумя руками (множитель к обычному радиусу). */
+export const HOLE_STRETCH_MAX = 3.2;
 /** Сколько искр разлетается в момент поглощения. */
 const SPARK_COUNT = 72;
 
@@ -65,6 +67,10 @@ export class BlackHole {
   #target = 0;
   #burst = 0;
   #hit = 0;
+  /** Растяжение двумя руками: 1 — обычное, больше — дыра раздувается. */
+  #stretch = 1;
+  /** Дыра взорвана: гаснет быстро и ярко, искры бьют во все стороны. */
+  #exploding = false;
 
   constructor() {
     this.#core = new THREE.Mesh(
@@ -125,6 +131,35 @@ export class BlackHole {
     return this.#radius;
   }
 
+  /** Текущее растяжение (1 — обычный размер). */
+  get stretch(): number {
+    return this.#stretch;
+  }
+
+  /**
+   * Растянуть дыру (двумя руками). 1 — обычный размер, дальше она раздувается, диски
+   * раскручиваются, а свечение уходит от фиолетового к раскалённому: видно, что «ещё
+   * немного — и рванёт».
+   */
+  setStretch(factor: number): void {
+    this.#stretch = Math.min(HOLE_STRETCH_MAX, Math.max(1, factor));
+  }
+
+  /** Взрыв: искры бьют во все стороны, дыра стремительно гаснет. */
+  explode(): void {
+    this.#burst = 1.2;
+    this.#exploding = true;
+    this.#phase = 'closing';
+    this.#target = 0.001;
+    for (let i = 0; i < SPARK_COUNT; i++) {
+      const angle = Math.random() * Math.PI * 2;
+      const speed = 1.4 + Math.random() * 2.2;
+      this.#sparkDirections[i * 3] = Math.cos(angle) * speed;
+      this.#sparkDirections[i * 3 + 1] = (Math.random() - 0.5) * 1.6;
+      this.#sparkDirections[i * 3 + 2] = Math.sin(angle) * speed;
+    }
+  }
+
   get position(): THREE.Vector3 {
     return this.object.position;
   }
@@ -132,6 +167,8 @@ export class BlackHole {
   /** Раскрыть дыру в точке `at`. `radius` — размер горизонта событий в мировых единицах. */
   open(at: THREE.Vector3, radius = 5): void {
     this.object.position.copy(at);
+    this.#stretch = 1;
+    this.#exploding = false;
     this.#base = Math.max(0.5, radius);
     this.#target = this.#base;
     this.#phase = 'opening';
@@ -167,8 +204,14 @@ export class BlackHole {
   hold(active: boolean): void {
     if (this.#phase === 'closed') return;
     this.#phase = active ? 'opening' : 'idle';
-    this.#target = active ? this.#base * 1.15 : this.#base * IDLE_SCALE;
+    this.#target = (active ? this.#base * 1.15 : this.#base * IDLE_SCALE) * this.#stretch;
     if (active) this.#burst = Math.max(this.#burst, 0.5);
+  }
+
+  /** Пересчитать размер с учётом растяжения (вызывается каждый кадр из графа). */
+  #applyStretch(): void {
+    if (this.#phase === 'closed' || this.#phase === 'closing') return;
+    this.#target = (this.#phase === 'opening' ? this.#base * 1.15 : this.#base * IDLE_SCALE) * this.#stretch;
   }
 
   /** Схлопнуться и погаснуть совсем (когда внутри ничего не осталось). */
@@ -185,11 +228,12 @@ export class BlackHole {
 
   update(dt: number, time: number): void {
     if (this.#phase === 'closed') return;
+    this.#applyStretch();
 
     const idle = this.#phase === 'idle';
     const rate = this.#phase === 'closing' ? CLOSE_RATE : idle ? 2.2 : OPEN_RATE;
     if (this.#phase === 'closing') {
-      this.#radius += (this.#target - this.#radius) * Math.min(1, dt * rate);
+      this.#radius += (this.#target - this.#radius) * Math.min(1, dt * (this.#exploding ? rate * 2.2 : rate));
       if (this.#radius < 0.12) {
         this.#phase = 'closed';
         this.#radius = 0;
@@ -198,8 +242,11 @@ export class BlackHole {
         return;
       }
     } else {
-      // Лёгкое «дыхание» открытой дыры: она живая, а не нарисованная.
-      const breath = this.#target * (1 + Math.sin(time * (idle ? 1.3 : 3.1)) * 0.035);
+      // Лёгкое «дыхание» открытой дыры: она живая, а не нарисованная. Растянутая дыра
+      // дышит чаще и сильнее — видно, что она едва держится.
+      const wobble = 0.035 + (this.#stretch - 1) * 0.03;
+      const speed = (idle ? 1.3 : 3.1) * (1 + (this.#stretch - 1) * 0.8);
+      const breath = this.#target * (1 + Math.sin(time * speed) * wobble);
       this.#radius += (breath - this.#radius) * Math.min(1, dt * rate);
     }
 
@@ -211,17 +258,22 @@ export class BlackHole {
     const glow = this.#glow.material as THREE.MeshBasicMaterial;
     // Осевшая дыра тускнеет: она ждёт, а не светит на всю сцену.
     const dim = idle ? 0.55 : 1;
+    const heat = Math.max(0, this.#stretch - 1) / (HOLE_STRETCH_MAX - 1);
     photon.opacity = (0.75 + flash * 0.25) * dim;
-    glow.opacity = (0.4 + flash * 0.5) * dim;
-    this.#glow.scale.setScalar(1 + flash * 0.5);
+    glow.opacity = Math.min(1, (0.4 + flash * 0.6 + heat * 0.5) * dim);
+    // Раскалённое кольцо: ближе к срыву — ярче свечение, и цвет уходит в белый.
+    this.#glow.scale.setScalar(1 + flash * 0.5 + heat * 0.6);
     this.#core.scale.setScalar(1 + flash * 0.25);
+    if (heat > 0) photon.color.setRGB(1, 0.94 - heat * 0.35, 0.82 - heat * 0.65);
 
     for (let i = 0; i < this.#rings.length; i++) {
       const ring = this.#rings[i];
       const spec = DISKS[i];
-      ring.points.rotation.y += dt * spec.speed * (1 + flash * 2.4) * (idle ? 0.5 : 1);
+      ring.points.rotation.y += dt * spec.speed * (1 + flash * 2.4) * (idle ? 0.5 : 1) * (1 + heat * 2.2);
       // Разгон при вспышке слегка «раскрывает» диски — видно, что дыра сработала.
-      ring.holder.rotation.z = Math.sin(time * 0.6 + i) * 0.05 + flash * 0.08;
+      ring.holder.rotation.z = Math.sin(time * 0.6 + i) * 0.05 + flash * 0.08 + heat * 0.12;
+      // Растянутая дыра раскачивает диски сильнее: она едва держится.
+      ring.holder.rotation.x = DISKS[i].tilt + Math.sin(time * 1.7 + i * 2) * heat * 0.25;
     }
 
     // Искры живут только во время вспышки.
