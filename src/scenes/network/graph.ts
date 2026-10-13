@@ -23,6 +23,7 @@ import {
 
 import { NEON, heatPalette } from '../../core/render/materials';
 import type { NetConnection } from '../../core/types';
+import { BlackHole } from './blackHole';
 
 export type NodeKind = 'local' | 'process' | 'remote';
 
@@ -64,6 +65,12 @@ export interface GraphNode {
   boostTarget?: number;
   /** Накопленный поворот узла (кистью/мышью при удержании), радианы. */
   spin?: number;
+  /** Бросок: пока задано, узел летит сам и заворачивает к чёрной дыре. */
+  thrown?: { vx: number; vy: number; vz: number };
+  /** Сколько секунд узел в полёте — страховка, чтобы эффект всегда завершался. */
+  throwT?: number;
+  /** 0..1 — насколько узел уже поглощён (анимация схлопывания в точку). */
+  devour?: number;
 }
 
 export interface GraphLink {
@@ -86,6 +93,14 @@ export interface GraphLink {
   absorb?: number;
   /** Итоговая прозрачность линии в этом кадре (для отрисовки и тестов). */
   alpha?: number;
+
+  /* ── Обрыв: узел вырвали (или выкинули) — линия рвётся, а не висит ── */
+  /** Точка, в которой линия оторвалась от узла (застывает в воздухе). */
+  cut?: { x: number; y: number; z: number };
+  /** 0..1 — прогресс обрыва: оторванный конец возвращается к дальнему узлу. */
+  cutT?: number;
+  /** Какой конец оторвался. */
+  cutFrom?: 'source' | 'target';
 }
 
 export interface Pulse {
@@ -110,6 +125,25 @@ const LINK_ABSORB_TIME = 0.8;
 const LINK_RELEASE_RATE = 2.4;
 const MAX_PULSES = 900;
 
+/**
+ * Чёрная дыра (выкинутый орб).
+ *
+ * Бросок: узел летит сам, а его скорость каждый кадр доворачивается в сторону дыры —
+ * получается затягивание по спирали, которое не может «промахнуться». Через
+ * THROW_PATIENCE секунд дыра тянет заметно сильнее: эффект обязан завершиться.
+ */
+const HOLE_RADIUS: Record<NodeKind, number> = { local: 7, process: 6.5, remote: 4.6 };
+const THROW_TURN = 2.6;
+const THROW_PATIENCE = 2.4;
+/** Сколько узел схлопывается в точку, оказавшись за горизонтом событий (с). */
+const DEVOUR_TIME = 0.62;
+/** Сколько линия «рвётся»: оторванный конец возвращается к дальнему узлу (с). */
+const CUT_TIME = 0.34;
+/** Сколько узлов можно держать одновременно (две руки). */
+const MAX_GRAB = 2;
+const SHELL_GEOMETRY = new THREE.IcosahedronGeometry(1, 1);
+const WHITE = new THREE.Color(1, 1, 1);
+
 export class ForceGraph {
   readonly object = new THREE.Group();
   readonly nodes: GraphNode[] = [];
@@ -131,9 +165,22 @@ export class ForceGraph {
   #pulsePositions: Float32Array;
   #selection = new THREE.Color();
   #tempColor = new THREE.Color();
-  #dragged: GraphNode | null = null;
-  /** Вращающаяся оболочка вокруг «вырванного» узла: делает поворот видимым. */
-  #inspectShell: THREE.Mesh;
+  /** Узлы в руках: двумя руками можно держать два орба одновременно. */
+  #grabbed: GraphNode[] = [];
+  /** Вращающиеся оболочки вокруг «вырванных» узлов: делают поворот видимым. */
+  #shells: THREE.Mesh[] = [];
+  /** Чёрная дыра: раскрывается на броске и поглощает выкинутый узел. */
+  #hole = new BlackHole();
+  /** Идентификаторы узлов, поглощённых чёрной дырой (пока не «Вернуть узлы»). */
+  #swallowed = new Set<string>();
+  /** Идентификаторы разорванных связей: синхронизация их больше не создаёт. */
+  #severed = new Set<string>();
+  /** Кого убрать после анимации поглощения (собирается в кадре, чистится после). */
+  #devouring: GraphNode[] = [];
+  #cutDone: GraphLink[] = [];
+  #devouredCount = 0;
+  /** Сцена узнаёт о поглощении: тост, панель, счётчики. */
+  onSwallow: ((node: GraphNode, links: number) => void) | null = null;
 
   constructor() {
     this.#localNode = {
@@ -196,22 +243,29 @@ export class ForceGraph {
     this.#linksMesh.frustumCulled = false;
     this.object.add(this.#linksMesh);
 
-    // Оболочка «вырванного» узла: каркасный икосаэдр, вращается вместе с ним.
+    // Оболочки «вырванных» узлов: каркасный икосаэдр, вращается вместе с узлом.
     // Обычная сфера при вращении не видна, а каркас сразу показывает поворот.
-    this.#inspectShell = new THREE.Mesh(
-      new THREE.IcosahedronGeometry(1, 1),
-      new THREE.MeshBasicMaterial({
-        color: 0xf472b6,
-        wireframe: true,
-        transparent: true,
-        opacity: 0.55,
-        blending: THREE.AdditiveBlending,
-        depthWrite: false,
-      }),
-    );
-    this.#inspectShell.visible = false;
-    this.#inspectShell.frustumCulled = false;
-    this.object.add(this.#inspectShell);
+    // Их несколько: двумя руками можно держать два орба одновременно.
+    for (let i = 0; i < MAX_GRAB; i++) {
+      const shell = new THREE.Mesh(
+        SHELL_GEOMETRY,
+        new THREE.MeshBasicMaterial({
+          color: 0xf472b6,
+          wireframe: true,
+          transparent: true,
+          opacity: 0.55,
+          blending: THREE.AdditiveBlending,
+          depthWrite: false,
+        }),
+      );
+      shell.visible = false;
+      shell.frustumCulled = false;
+      this.#shells.push(shell);
+      this.object.add(shell);
+    }
+
+    // Чёрная дыра живёт в том же групповом объекте: она часть сцены сети.
+    this.object.add(this.#hole.object);
 
     // Импульсы.
     this.#pulsePositions = new Float32Array(MAX_PULSES * 3).fill(1e6);
@@ -248,6 +302,8 @@ export class ForceGraph {
     for (const connection of connections) {
       const processId = `process:${connection.process}`;
       const remoteId = `remote:${connection.remote.ip}:${connection.remote.port}:${connection.protocol}`;
+      // Узел проглочен чёрной дырой: он вернётся только по «Вернуть узлы».
+      if (this.#swallowed.has(processId) || this.#swallowed.has(remoteId)) continue;
 
       const processNode = this.#ensureNode(processId, () => ({
         id: processId,
@@ -292,15 +348,17 @@ export class ForceGraph {
         'process-remote',
         connection,
       );
-      link.heat = Math.min(1, link.heat + 0.5);
-      if (connection.state === 'ESTABLISHED') this.#spawnPulse(link);
+      if (link) {
+        link.heat = Math.min(1, link.heat + 0.5);
+        if (connection.state === 'ESTABLISHED') this.#spawnPulse(link);
+      }
     }
 
     // Чистим то, что исчезло из таблицы соединений.
     for (let i = this.nodes.length - 1; i >= 0; i--) {
       const node = this.nodes[i];
       if (node.kind === 'local' || seen.has(node.id)) continue;
-      if (this.#dragged === node) this.#dragged = null;
+      this.#forgetGrabbed(node);
       this.nodes.splice(i, 1);
       this.#byId.delete(node.id);
     }
@@ -317,11 +375,7 @@ export class ForceGraph {
       node.degree = this.links.filter((link) => link.source === node || link.target === node).length;
     }
 
-    this.#simulation.nodes(this.nodes);
-    // forceLink типизирован как Force<GraphNode, GraphLink>; сужаем безопасно.
-    const linkForce = this.#simulation.force('link') as unknown as { links(links: GraphLink[]): void };
-    linkForce.links(this.links);
-    this.#simulation.alpha(Math.max(this.#simulation.alpha(), 0.55));
+    this.#refreshLinks(0.55);
 
     this.#rebuildInstances();
   }
@@ -345,7 +399,9 @@ export class ForceGraph {
     target: GraphNode,
     kind: GraphLink['kind'],
     connection: NetConnection,
-  ): GraphLink {
+  ): GraphLink | null {
+    // Связь разорвана (узел вырвали / выкинули): пока не «Вернуть узлы» — не создаём.
+    if (this.#severed.has(id)) return null;
     const existing = this.links.find((link) => link.id === id);
     if (existing) {
       existing.connection = connection;
@@ -354,6 +410,21 @@ export class ForceGraph {
     const link: GraphLink = { id, source, target, connection, heat: 0.4, kind };
     this.links.push(link);
     return link;
+  }
+
+  /** Пересобрать силы физики: рвущиеся и поглощённые связи в них не участвуют. */
+  #refreshLinks(alpha = 0.35): void {
+    this.#simulation.nodes(this.nodes);
+    // forceLink типизирован как Force<GraphNode, GraphLink>; сужаем безопасно.
+    const linkForce = this.#simulation.force('link') as unknown as { links(links: GraphLink[]): void };
+    linkForce.links(this.links.filter((link) => link.cutT === undefined));
+    this.#simulation.alpha(Math.max(this.#simulation.alpha(), alpha));
+  }
+
+  /** Убрать узел из списка «в руках» (например, силу отобрали или его проглотили). */
+  #forgetGrabbed(node: GraphNode): void {
+    const index = this.#grabbed.indexOf(node);
+    if (index >= 0) this.#grabbed.splice(index, 1);
   }
 
   #spawnPulse(link: GraphLink): void {
@@ -388,16 +459,16 @@ export class ForceGraph {
    *  • через LINK_ABSORB_START секунд линия затягивается в орб (absorb → 1);
    *  • после отпускания — плавно выкатывается обратно к своему узлу.
    */
-  #updateRubberBand(link: GraphLink, dragged: GraphNode | null, dt: number): void {
-    const attached = dragged && (link.source === dragged || link.target === dragged);
+  #updateRubberBand(link: GraphLink, dt: number): void {
+    const held = this.#grabbed.find((node) => link.source === node || link.target === node) ?? null;
 
-    if (attached && dragged) {
-      const nodeX = dragged.x ?? 0;
-      const nodeY = dragged.y ?? 0;
-      const nodeZ = dragged.z ?? 0;
-      if (link.orb !== dragged || !link.rab) {
+    if (held) {
+      const nodeX = held.x ?? 0;
+      const nodeY = held.y ?? 0;
+      const nodeZ = held.z ?? 0;
+      if (link.orb !== held || !link.rab) {
         // Только что вырвали: точка крепления стартует из узла и остаётся за ним.
-        link.orb = dragged;
+        link.orb = held;
         link.rab = { x: nodeX, y: nodeY, z: nodeZ };
         link.rabT = 0;
       }
@@ -411,6 +482,9 @@ export class ForceGraph {
         link.rabT > LINK_ABSORB_START
           ? Math.min(1, (link.rabT - LINK_ABSORB_START) / LINK_ABSORB_TIME)
           : 0;
+      // Линия всосалась в орб целиком — соединение РАЗОрвано: оно ушло внутрь узла
+      // и обратно уже не выкатится (до «Вернуть узлы»). Это и есть «вырвать из цепочки».
+      if (link.absorb >= 1) this.#severLink(link, held, false);
       return;
     }
 
@@ -433,10 +507,10 @@ export class ForceGraph {
   }
 
   /** Шаг физики + обновление геометрии. Вызывается каждый кадр. */
-  update(dt: number, time: number, selectedId: string | null): void {
+  update(dt: number, time: number, selectedId: string | null, camera?: THREE.Camera): void {
     // Физику гоняем только пока система «горячая» — иначе CPU простаивает.
     // Во время перетаскивания узел тянет пользователь, физика должна отзываться сразу.
-    if (this.#simulation.alpha() > 0.005 || this.#dragged) this.#simulation.tick();
+    if (this.#simulation.alpha() > 0.005 || this.#grabbed.length > 0) this.#simulation.tick();
 
     for (const node of this.nodes) {
       // Плавное затухание интенсивности и подъём «пульсации» процесса.
@@ -447,7 +521,16 @@ export class ForceGraph {
       const boostTarget = node.boostTarget ?? 0;
       const boost = node.boost ?? 0;
       node.boost = boost + (boostTarget - boost) * Math.min(1, dt * (boostTarget > boost ? 7 : 4));
+      // Выкинутый орб: летит сам и заворачивает к чёрной дыре.
+      if (node.thrown) this.#flyToHole(node, dt);
+      // Поглощение: узел сжимается в точку за горизонтом событий.
+      if (node.devour !== undefined) this.#devourStep(node, dt);
     }
+    // Список нельзя менять внутри обхода — убираем проглоченных после него.
+    if (this.#devouring.length > 0) this.#forgetDevoured();
+
+    this.#hole.update(dt, time);
+    if (camera) this.#hole.faceCamera(camera);
 
     const matrix = new THREE.Matrix4();
     const scale = new THREE.Vector3();
@@ -457,7 +540,8 @@ export class ForceGraph {
       const base =
         node.kind === 'local' ? 5.4 : node.kind === 'process' ? 2.1 + Math.min(node.degree, 12) * 0.12 : 1.35;
       const inspect = 1 + (node.boost ?? 0) * (node.kind === 'remote' ? 2.6 : 1.9);
-      const size = base * (0.85 + node.intensity * 0.55) * pulse * inspect;
+      const eaten = 1 - Math.min(1, node.devour ?? 0);
+      const size = base * (0.85 + node.intensity * 0.55) * pulse * inspect * eaten;
       scale.setScalar(size);
       matrix.makeScale(scale.x, scale.y, scale.z);
       matrix.setPosition(node.x ?? 0, node.y ?? 0, node.z ?? 0);
@@ -477,28 +561,35 @@ export class ForceGraph {
       } else {
         color.multiplyScalar(0.65 + node.intensity * 0.6);
       }
+      // Поглощаемый узел гаснет вместе с размером.
+      if (eaten < 1) color.multiplyScalar(0.3 + eaten * 0.7);
       this.#nodeMesh.setColorAt(i, color);
     }
     this.#nodeMesh.count = Math.max(1, this.nodes.length);
 
-    // Оболочка рассматриваемого узла: следует за ним и вращается.
-    const inspected = this.#dragged;
-    if (inspected) {
-      this.#inspectShell.visible = true;
-      this.#inspectShell.position.set(inspected.x ?? 0, inspected.y ?? 0, inspected.z ?? 0);
+    // Оболочки «взятых» узлов: следуют за ними и вращаются вместе с поворотом кисти.
+    for (let i = 0; i < this.#shells.length; i++) {
+      const shell = this.#shells[i];
+      const inspected = this.#grabbed[i];
+      if (!inspected) {
+        shell.visible = false;
+        continue;
+      }
+      shell.visible = true;
+      shell.position.set(inspected.x ?? 0, inspected.y ?? 0, inspected.z ?? 0);
       const shellScale =
         (inspected.kind === 'local' ? 5.4 : inspected.kind === 'process' ? 2.6 : 1.6) *
-        (1 + (inspected.boost ?? 0) * 2.2);
-      this.#inspectShell.scale.setScalar(shellScale);
-      this.#inspectShell.rotation.set((inspected.spin ?? 0) * 0.35, inspected.spin ?? 0, 0);
-    } else {
-      this.#inspectShell.visible = false;
+        (1 + (inspected.boost ?? 0) * 2.2) *
+        (1 - Math.min(1, inspected.devour ?? 0));
+      shell.scale.setScalar(Math.max(0.001, shellScale));
+      shell.rotation.set((inspected.spin ?? 0) * 0.35, inspected.spin ?? 0, 0);
     }
     this.#nodeMesh.instanceMatrix.needsUpdate = true;
     if (this.#nodeMesh.instanceColor) this.#nodeMesh.instanceColor.needsUpdate = true;
 
-    // Рёбра: позиции узлов, «остывание» и резинка выдёргиваемого узла.
+    // Рёбра: позиции узлов, «остывание», резинка выдёргиваемого узла и обрыв связи.
     let linkIndex = 0;
+    this.#cutDone.length = 0;
     for (const link of this.links) {
       link.heat = Math.max(link.heat - dt * 0.35, 0.12);
       const offset = linkIndex * 6;
@@ -510,7 +601,32 @@ export class ForceGraph {
       let by = link.target.y ?? 0;
       let bz = link.target.z ?? 0;
 
-      this.#updateRubberBand(link, this.#dragged, dt);
+      let flash = 0;
+      if (link.cutT !== undefined) {
+        // Разрыв: оторванный конец «отщёлкивает» к дальнему узлу, линия гаснет со вспышкой.
+        link.cutT = Math.min(1, link.cutT + dt / CUT_TIME);
+        const from = link.cut;
+        const side = link.cutFrom;
+        if (from && side) {
+          const far = side === 'source' ? link.target : link.source;
+          const recoil = link.cutT * link.cutT;
+          const freeX = from.x + ((far.x ?? 0) - from.x) * recoil;
+          const freeY = from.y + ((far.y ?? 0) - from.y) * recoil;
+          const freeZ = from.z + ((far.z ?? 0) - from.z) * recoil;
+          if (side === 'source') {
+            ax = freeX;
+            ay = freeY;
+            az = freeZ;
+          } else {
+            bx = freeX;
+            by = freeY;
+            bz = freeZ;
+          }
+        }
+        flash = Math.max(0, 1 - link.cutT * 2.5);
+        if (link.cutT >= 1) this.#cutDone.push(link);
+      } else {
+      this.#updateRubberBand(link, dt);
       const anchor = link.orb;
       if (anchor) {
         const nodeX = anchor.x ?? 0;
@@ -546,8 +662,9 @@ export class ForceGraph {
           }
         }
       }
+      }
 
-      link.alpha = 1 - (link.absorb ?? 0);
+      link.alpha = link.cutT !== undefined ? 1 - link.cutT : 1 - (link.absorb ?? 0);
       this.#linkPositions[offset] = ax;
       this.#linkPositions[offset + 1] = ay;
       this.#linkPositions[offset + 2] = az;
@@ -563,6 +680,8 @@ export class ForceGraph {
       }
       // Затягивание в орб гасит линию: она буквально «уходит внутрь» узла.
       color.multiplyScalar(link.alpha);
+      // Вспышка на разрыве: в первые мгновения линия белая, будто искрит.
+      if (flash > 0) color.lerp(WHITE, flash);
       this.#linkColors[offset] = color.r;
       this.#linkColors[offset + 1] = color.g;
       this.#linkColors[offset + 2] = color.b;
@@ -571,6 +690,20 @@ export class ForceGraph {
       this.#linkColors[offset + 5] = color.b * 0.55;
       linkIndex++;
     }
+    // Дорвавшиеся линии убираем из графа — связь разорвана окончательно.
+    if (this.#cutDone.length > 0) {
+      for (const link of this.#cutDone) {
+        const index = this.links.indexOf(link);
+        if (index >= 0) this.links.splice(index, 1);
+        for (let i = this.pulses.length - 1; i >= 0; i--) {
+          if (this.pulses[i].link === link) this.pulses.splice(i, 1);
+        }
+      }
+      this.#cutDone.length = 0;
+      this.#rebuildInstances();
+      this.#refreshLinks();
+    }
+
     this.#linksGeometry.setDrawRange(0, this.links.length * 2);
     (this.#linksGeometry.attributes.position as THREE.BufferAttribute).needsUpdate = true;
     (this.#linksGeometry.attributes.color as THREE.BufferAttribute).needsUpdate = true;
@@ -614,6 +747,7 @@ export class ForceGraph {
     let best: GraphNode | null = null;
     let bestDistance = Number.POSITIVE_INFINITY;
     for (const node of this.nodes) {
+      if (node.devour !== undefined) continue;
       point.set(node.x ?? 0, node.y ?? 0, node.z ?? 0).project(camera);
       if (point.z < -1 || point.z > 1) continue;
       const distance = Math.hypot(point.x - ndcX, point.y - ndcY);
@@ -632,8 +766,32 @@ export class ForceGraph {
 
   /* ─────────────── Перетаскивание узлов (мышь/жест «щипок») ─────────────── */
 
+  /** Последний взятый узел: с ним работают жесты и мышь. */
   get dragged(): GraphNode | null {
-    return this.#dragged;
+    return this.#grabbed[this.#grabbed.length - 1] ?? null;
+  }
+
+  /** Все узлы в руках: двумя руками можно держать два орба одновременно. */
+  get grabbedNodes(): readonly GraphNode[] {
+    return this.#grabbed;
+  }
+
+  get grabbedCount(): number {
+    return this.#grabbed.length;
+  }
+
+  /** Сколько узлов проглотила чёрная дыра (для панели сцены). */
+  get devoured(): number {
+    return this.#devouredCount;
+  }
+
+  /** Сколько связей разорвано и ждёт «Вернуть узлы». */
+  get severedCount(): number {
+    return this.#severed.size;
+  }
+
+  get hole(): BlackHole {
+    return this.#hole;
   }
 
   /**
@@ -641,7 +799,7 @@ export class ForceGraph {
    * (`moveDragged`), а физика перестаёт его тянуть. Возвращает сам узел.
    */
   beginDrag(node: GraphNode): GraphNode {
-    this.#dragged = node;
+    if (!this.#grabbed.includes(node)) this.#grabbed.push(node);
     node.fx = node.x ?? 0;
     node.fy = node.y ?? 0;
     node.fz = node.z ?? 0;
@@ -650,8 +808,7 @@ export class ForceGraph {
   }
 
   /** Двигать взятый узел в мировую точку (луч курсора × плоскость узла). */
-  moveDragged(point: THREE.Vector3): void {
-    const node = this.#dragged;
+  moveDragged(point: THREE.Vector3, node: GraphNode | null = this.dragged): void {
     if (!node) return;
     node.fx = point.x;
     node.fy = point.y;
@@ -670,10 +827,9 @@ export class ForceGraph {
    * Отпустить узел. `pin = true` — узел остаётся закреплённым там, где его оставили
    * (удобно «расставлять» узлы руками), иначе возвращается в физику.
    */
-  endDrag(pin: boolean): void {
-    const node = this.#dragged;
-    this.#dragged = null;
+  endDrag(pin: boolean, node: GraphNode | null = this.dragged): void {
     if (!node) return;
+    this.#forgetGrabbed(node);
     if (!pin) {
       node.fx = null;
       node.fy = null;
@@ -683,21 +839,133 @@ export class ForceGraph {
   }
 
   /**
-   * Раздуть узел для осмотра (пока его держат): узел растёт, вокруг появляется вращающийся
-   * каркас. `target = 0` — плавно вернуть к обычному размеру (после отпускания).
+   * Бросок: орб вырвали и выкинули. Он превращается в «снаряд», а впереди по направлению
+   * броска раскрывается чёрная дыра: узел затягивает по спирали, он схлопывается в точку,
+   * и все его связи рвутся. `false` — узел бросать нельзя (сама машина или уже проглочен).
    */
-  setBoost(node: GraphNode, target: number, spin = node.spin ?? 0): void {
-    node.boostTarget = target;
-    node.spin = spin;
-    if (target > 0 && this.#dragged !== node) {
-      this.#dragged = node;
-      node.fx = node.x ?? 0;
-      node.fy = node.y ?? 0;
-      node.fz = node.z ?? 0;
-      this.#simulation.alpha(Math.max(this.#simulation.alpha(), 0.4));
+  throwNode(node: GraphNode, velocity: THREE.Vector3): boolean {
+    if (node.kind === 'local' || node.devour !== undefined || node.thrown) return false;
+    this.#forgetGrabbed(node);
+    node.fx = node.x ?? 0;
+    node.fy = node.y ?? 0;
+    node.fz = node.z ?? 0;
+    node.thrown = { vx: velocity.x, vy: velocity.y, vz: velocity.z };
+    node.throwT = 0;
+    // Летящий орб заметно крупнее: видно, что именно он улетает.
+    node.boostTarget = Math.max(node.boostTarget ?? 0, 1.6);
+
+    const speed = velocity.length();
+    const direction = speed > 1e-3 ? velocity.clone().divideScalar(speed) : new THREE.Vector3(0, 0, -1);
+    const lead = Math.min(160, Math.max(34, speed * 0.8));
+    const at = new THREE.Vector3(node.x ?? 0, node.y ?? 0, node.z ?? 0).addScaledVector(direction, lead);
+    if (at.length() > 240) at.setLength(240);
+    this.#hole.open(at, HOLE_RADIUS[node.kind]);
+    this.#simulation.alpha(Math.max(this.#simulation.alpha(), 0.5));
+    return true;
+  }
+
+  /**
+   * Полёт брошенного узла. Скорость каждый кадр доворачивается в сторону дыры, поэтому
+   * затягивание выходит по спирали и не может «промахнуться»; если узел почему-то не
+   * долетает, дыра тянет сильнее — эффект обязан завершиться.
+   */
+  #flyToHole(node: GraphNode, dt: number): void {
+    const thrown = node.thrown;
+    if (!thrown) return;
+    node.throwT = (node.throwT ?? 0) + dt;
+
+    const target = this.#hole.position;
+    const hx = target.x - (node.x ?? 0);
+    const hy = target.y - (node.y ?? 0);
+    const hz = target.z - (node.z ?? 0);
+    const distance = Math.hypot(hx, hy, hz) || 1;
+    const patience = node.throwT > THROW_PATIENCE ? 2.2 : 1;
+    const desire = Math.min(190, (26 + distance * 1.6 + node.throwT * 14) * patience);
+    const turn = Math.min(1, dt * THROW_TURN * patience);
+    thrown.vx += ((hx / distance) * desire - thrown.vx) * turn;
+    thrown.vy += ((hy / distance) * desire - thrown.vy) * turn;
+    thrown.vz += ((hz / distance) * desire - thrown.vz) * turn;
+
+    node.x = (node.x ?? 0) + thrown.vx * dt;
+    node.y = (node.y ?? 0) + thrown.vy * dt;
+    node.z = (node.z ?? 0) + thrown.vz * dt;
+    node.fx = node.x;
+    node.fy = node.y;
+    node.fz = node.z;
+    node.spin = (node.spin ?? 0) + dt * 7;
+    if (distance < this.#hole.radius * 0.85) this.#startDevour(node);
+  }
+
+  /** Узел у горизонта событий: связи рвутся, узел схлопывается в точку. */
+  #startDevour(node: GraphNode): void {
+    if (node.devour !== undefined) return;
+    node.devour = 0;
+    node.thrown = undefined;
+    node.throwT = undefined;
+    for (const link of [...this.links]) {
+      if (link.source === node || link.target === node) this.#severLink(link, node);
     }
-    // Осмотр закончен: узел остаётся там, где его оставили (закрепление не снимаем).
-    if (target === 0 && this.#dragged === node) this.#dragged = null;
+    this.#hole.pulse(1);
+  }
+
+  #devourStep(node: GraphNode, dt: number): void {
+    node.devour = Math.min(1, (node.devour ?? 0) + dt / DEVOUR_TIME);
+    if (node.devour >= 1) this.#devouring.push(node);
+  }
+
+  /** Убрать проглоченные узлы: они вернутся только кнопкой «Вернуть узлы». */
+  #forgetDevoured(): void {
+    const swallowed = this.#devouring.splice(0, this.#devouring.length);
+    for (const node of swallowed) {
+      this.#swallowed.add(node.id);
+      this.#forgetGrabbed(node);
+      const index = this.nodes.indexOf(node);
+      if (index >= 0) this.nodes.splice(index, 1);
+      this.#byId.delete(node.id);
+      let links = 0;
+      for (let i = this.links.length - 1; i >= 0; i--) {
+        const link = this.links[i];
+        if (link.source !== node && link.target !== node) continue;
+        this.#severed.add(link.id);
+        this.links.splice(i, 1);
+        links++;
+      }
+      for (let i = this.pulses.length - 1; i >= 0; i--) {
+        const pulse = this.pulses[i];
+        if (pulse.link.source === node || pulse.link.target === node) this.pulses.splice(i, 1);
+      }
+      this.#devouredCount++;
+      this.onSwallow?.(node, links);
+    }
+    for (const node of this.nodes) {
+      node.degree = this.links.filter((link) => link.source === node || link.target === node).length;
+    }
+    this.#rebuildInstances();
+    this.#refreshLinks();
+    this.#hole.pulse(1);
+    this.#hole.close();
+  }
+
+  /**
+   * Разорвать связь: узел `from` «выпускает» линию. Если рвут на глазах (`snap`),
+   * точка отрыва застывает в воздухе и оторванный конец с вспышкой возвращается к дальнему
+   * узлу. Разорванная связь запоминается — синхронизация её больше не создаёт, пока
+   * пользователь не нажмёт «Вернуть узлы».
+   */
+  #severLink(link: GraphLink, from: GraphNode, snap = true): void {
+    this.#severed.add(link.id);
+    if (link.cutT !== undefined) return;
+    link.absorb = 0;
+    link.rab = undefined;
+    link.orb = undefined;
+    link.rabT = undefined;
+    if (snap) {
+      link.cut = { x: from.x ?? 0, y: from.y ?? 0, z: from.z ?? 0 };
+      link.cutFrom = link.source === from ? 'source' : 'target';
+    }
+    // Без `snap` (линия уже всосалась в орб) отрывать нечего — показ закончен сразу.
+    link.cutT = snap ? 0 : 1;
+    this.#refreshLinks();
   }
 
   /** Повернуть рассматриваемый узел (кистью при удержании). */
@@ -705,7 +973,20 @@ export class ForceGraph {
     node.spin = (node.spin ?? 0) + delta;
   }
 
-  /** Снять все закрепления и вернуть узлы в физику (кнопка «Вернуть узлы», жест «кулак»). */
+  /**
+   * Раздуть узел для осмотра (пока его держат): узел растёт, вокруг появляется вращающийся
+   * каркас. `target = 0` — плавно вернуть к обычному размеру (после отпускания).
+   */
+  setBoost(node: GraphNode, target: number, spin = node.spin ?? 0): void {
+    node.boostTarget = target;
+    node.spin = spin;
+  }
+
+  /**
+   * Вернуть всё в исходное: снять закрепления, вернуть разорванные связи и оживить
+   * проглоченные узлы (кнопка «Вернуть узлы», жест «кулак»). Сцена после этого делает
+   * `sync(...)`, и граф собирается заново из живых соединений.
+   */
   unpinAll(): void {
     for (const node of this.nodes) {
       node.fx = null;
@@ -713,18 +994,32 @@ export class ForceGraph {
       node.fz = null;
       node.boostTarget = 0;
       node.spin = 0;
+      node.thrown = undefined;
+      node.throwT = undefined;
+      node.devour = undefined;
     }
-    this.#dragged = null;
-    this.#inspectShell.visible = false;
+    this.#grabbed.length = 0;
+    this.#devouring.length = 0;
+    this.#cutDone.length = 0;
+    for (const shell of this.#shells) shell.visible = false;
+    this.#swallowed.clear();
+    this.#severed.clear();
+    this.#devouredCount = 0;
+    for (let i = this.links.length - 1; i >= 0; i--) {
+      if (this.links[i].cutT !== undefined) this.links.splice(i, 1);
+    }
+    this.#hole.close();
     this.#simulation.alpha(Math.max(this.#simulation.alpha(), 0.6));
   }
 
   dispose(): void {
-    // NODE_GEOMETRY общая для всех экземпляров — её не освобождаем.
+    // NODE_GEOMETRY и SHELL_GEOMETRY общие для всех экземпляров — их не освобождаем.
     this.#nodeMaterial.dispose();
     this.#linksGeometry.dispose();
     (this.#linksMesh.material as THREE.Material).dispose();
     this.#pulsesGeometry.dispose();
     (this.#pulsesMesh.material as THREE.Material).dispose();
+    for (const shell of this.#shells) (shell.material as THREE.Material).dispose();
+    this.#hole.dispose();
   }
 }

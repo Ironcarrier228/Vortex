@@ -44,7 +44,11 @@ export interface SceneContext {
    */
   mode: 'main' | 'output';
   /** Показывает тост в HUD. */
-  toast(kind: 'info' | 'warn' | 'error', message: string): void;
+  toast(
+    kind: 'info' | 'warn' | 'error',
+    message: string,
+    options?: { action?: { label: string; run: () => void } },
+  ): void;
   /** Спросить подтверждение (используется удалением в корзину). */
   confirm(options: { title: string; message: string; confirmLabel?: string; danger?: boolean }): Promise<boolean>;
   /** Инвалидировать размеры (после смены DPR/качества). */

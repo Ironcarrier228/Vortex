@@ -62,7 +62,7 @@ class App implements AppHost {
         this,
         this.prefs,
       )),
-      toast: (kind, message) => this.#hud.toast(kind, message),
+      toast: (kind, message, options) => this.#hud.toast(kind, message, options),
       confirm: (options) => this.#hud.confirm(options),
       requestResize: () => this.#engine.invalidate(),
     };

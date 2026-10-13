@@ -167,6 +167,8 @@ body {
 
 .hud-label {
   color: var(--text-faint);
+  /* Подсказки жестов многострочные: переносы из строки сохраняем как есть. */
+  white-space: pre-line;
   font-size: 10.5px;
   letter-spacing: 0.14em;
   text-transform: uppercase;

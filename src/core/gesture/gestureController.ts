@@ -111,6 +111,7 @@ export class GestureController {
   #lastPalmX = 0;
   #swipeCooldown = 0;
 
+  #secondaryPinching = false;
   #twoHandArmed = false;
   #twoHandBaseline = 1;
   #twoHandPrevAngle = 0;
@@ -216,6 +217,7 @@ export class GestureController {
       this.state.pinch.progress = 0;
       this.state.pinch.ratio = 1;
       this.state.grabbed = false;
+      this.#secondaryPinching = false;
       this.state.twoHand.active = false;
       this.state.twoHand.twist = 0;
       this.#twoHandArmed = false;
@@ -280,7 +282,11 @@ export class GestureController {
     else if (wasPinching && ratio > exit) this.state.pinch.active = false;
     this.state.pinch.ratio = ratio;
     this.state.pinch.strength = Math.min(1, Math.max(0, (exit - ratio) / (exit - enter * 0.6)));
-    this.state.secondaryPinch = this.#rawSecondaryPinchRatio < PINCH_ENTER;
+    // Вторая рука щиплется по той же калибровке, что и первая: абсолютный порог
+    // 0.42 не ловил щипок далёкой/наклонённой руки — это и был «щипок не робит».
+    if (this.#rawSecondaryPinchRatio < enter) this.#secondaryPinching = true;
+    else if (this.#rawSecondaryPinchRatio > exit) this.#secondaryPinching = false;
+    this.state.secondaryPinch = this.#secondaryPinching;
 
     // ── Поворот кисти (им вращается «вырванный» объект).
     this.#roll += angleDelta(this.#roll, this.#rawRoll) * Math.min(1, dt * 14);

@@ -38,6 +38,13 @@ const GRAB_RADIUS_MOUSE = 0.045;
 const GRAB_RADIUS_HAND = 0.085;
 /** Максимальное удаление узла от центра сцены при перетаскивании (мировые единицы). */
 const NODE_DRAG_LIMIT = 190;
+/**
+ * Скорость (мировые единицы в секунду), при которой отпускание считается **броском**:
+ * орб выкинули — перед ним раскрывается чёрная дыра и поглощает его вместе со связями.
+ */
+const THROW_SPEED_MIN = 52;
+/** Чувствительность вращения сцены щипком в пустоте (радианы на единицу NDC). */
+const SPACE_ROTATE_SPEED = 2.4;
 
 export class NetworkScene implements SceneModule {
   readonly id = 'network' as const;
@@ -94,6 +101,25 @@ export class NetworkScene implements SceneModule {
   #projected = new THREE.Vector3();
   /** Прошлый поворот кисти: приращение вращает «вырванный» узел. */
   #lastRoll = 0;
+  /** Скорость узла в руке: по ней отличаем «положить» от «выбросить». */
+  #dragVelocity = new THREE.Vector3();
+  #lastDragPoint = new THREE.Vector3();
+  #hasDragPoint = false;
+  /** Щипок в пустоте: тянем не узел, а саму сцену (вращение и наклон графа). */
+  #spaceHold: THREE.Vector2 | null = null;
+  #lastSpaceRoll = 0;
+  /** Вторая рука: свой орб, своя скорость — двумя руками можно держать два узла. */
+  #second = {
+    node: null as GraphNode | null,
+    plane: new THREE.Plane(),
+    offset: new THREE.Vector3(),
+    point: new THREE.Vector3(),
+    last: new THREE.Vector3(),
+    velocity: new THREE.Vector3(),
+    hasLast: false,
+    ndc: new THREE.Vector2(),
+  };
+  #tempVec = new THREE.Vector3();
 
   constructor(ctx: SceneContext) {
     this.#ctx = ctx;
@@ -110,6 +136,14 @@ export class NetworkScene implements SceneModule {
     });
 
     this.scene.add(this.#graph.object);
+    // Чёрная дыра проглотила орб: говорим об этом прямо и сразу предлагаем вернуть.
+    this.#graph.onSwallow = (node, links) => {
+      this.#updateDiagnostics();
+      this.#renderPanel();
+      this.#ctx.toast('info', `Чёрная дыра поглотила «${node.label}» · разорвано связей: ${links}`, {
+        action: { label: 'Вернуть узлы', run: () => this.#releaseAllNodes() },
+      });
+    };
     this.scene.add(this.#globe);
     this.#globe.visible = false;
 
@@ -342,12 +376,19 @@ export class NetworkScene implements SceneModule {
     this.#orbit.reset();
   }
 
-  /** Вернуть узлы в физику (кнопка в панели). Камеру не трогаем. */
+  /**
+   * Вернуть всё назад (кнопка в панели). Камеру не трогаем: оживают разорванные связи,
+   * возвращаются проглоченные чёрной дырой узлы, снимаются закрепления.
+   */
   #releaseAllNodes(): void {
     this.#releaseDrag();
+    this.#releaseSecond(true);
     this.#graph.unpinAll();
     this.#dragCandidate = null;
-    this.#ctx.toast('info', 'Узлы возвращены в физику графа');
+    if (!this.#globeActive) this.#graph.sync(this.#connections);
+    this.#updateDiagnostics();
+    this.#renderPanel();
+    this.#ctx.toast('info', 'Узлы возвращены: разорванные связи и проглоченные орбы на месте');
   }
 
   /** Две руки: разведение — зум, поворот кистей — вращение вокруг центра. */
@@ -513,12 +554,13 @@ export class NetworkScene implements SceneModule {
   update(dt: number, time: number, state: SceneState): void {
     // Курсор: мышь обновляет его событиями, рука — каждый кадр слоем жестов.
     this.#syncPointer();
-    this.#updateDrag();
+    this.#updateDrag(dt);
+    this.#updateSecondaryHand(dt);
 
     if (this.#globeActive) {
       this.#updateGlobe(dt, time);
     } else {
-      this.#graph.update(dt, time, this.#selected?.id ?? null);
+      this.#graph.update(dt, time, this.#selected?.id ?? null, this.camera);
     }
     this.#orbit.update(dt);
     this.#updateLabels();
@@ -570,6 +612,8 @@ export class NetworkScene implements SceneModule {
   #beginDrag(node: GraphNode): void {
     this.#dragging = true;
     this.#dragCandidate = null;
+    this.#dragVelocity.set(0, 0, 0);
+    this.#hasDragPoint = false;
     this.#graph.beginDrag(node);
     // «Вырвать из цепочки»: узел раздувается для осмотра, а панель сразу показывает
     // его запросы — пока держим, видно, куда он ходит.
@@ -593,13 +637,20 @@ export class NetworkScene implements SceneModule {
   }
 
   /** Обновление узла под указателем: луч камеры × плоскость, «замороженная» при захвате. */
-  #updateDrag(): void {
+  #updateDrag(dt: number): void {
     if (this.#dragging) {
       const hit = this.#pointerOnDragPlane();
       if (hit) {
         const point = this.#dragPoint.copy(hit).add(this.#dragOffset);
         // Ограничиваем перемещение сферой вокруг центра: узел не улетает в пустоту.
         if (point.length() > NODE_DRAG_LIMIT) point.setLength(NODE_DRAG_LIMIT);
+        // Скорость руки: по ней на отпускании понимаем, что орб не положили, а выкинули.
+        if (this.#hasDragPoint && dt > 0.0001) {
+          const instant = this.#tempVec.copy(point).sub(this.#lastDragPoint).divideScalar(dt);
+          this.#dragVelocity.lerp(instant, Math.min(1, dt * 9));
+        }
+        this.#lastDragPoint.copy(point);
+        this.#hasDragPoint = true;
         this.#graph.moveDragged(point);
         this.#projected.set(point.x, point.y, point.z).project(this.camera);
         this.#ctx.gesture.setTether({
@@ -622,15 +673,23 @@ export class NetworkScene implements SceneModule {
 
     const candidate = this.#dragCandidate;
     const pointer = this.#ctx.pointer.state;
-    if (!pointer.pressed) return;
+    if (!pointer.pressed) {
+      this.#spaceHold = null;
+      return;
+    }
 
     // Рукой щипок мог случиться рядом с узлом: пока палец сжат, продолжаем искать узел
     // под курсором и берём первый же — иначе жест выглядит «неработающим».
     if (!candidate) {
       if (pointer.source !== 'hand') return;
       const node = this.#graph.hitTest(this.camera, this.#ndc.x, this.#ndc.y, GRAB_RADIUS_HAND);
-      if (!node) return;
+      // Узел не поймали — значит щипок в пустоте: тянем саму сцену (граф вращается за рукой).
+      if (!node) {
+        this.#holdSpace();
+        return;
+      }
       this.#hovered = node;
+      this.#spaceHold = null;
       this.#beginDrag(node);
       return;
     }
@@ -654,16 +713,129 @@ export class NetworkScene implements SceneModule {
     this.#dragging = false;
     this.#orbit.setSuspended(false);
     const node = this.#graph.dragged;
+    const speed = this.#dragVelocity.length();
+    // Рывок кистью (или мыши) = бросок: орб выкинули в чёрную дыру.
+    const thrown = node && speed > THROW_SPEED_MIN ? this.#graph.throwNode(node, this.#dragVelocity) : false;
     if (node) this.#graph.setBoost(node, 0);
-    this.#graph.endDrag(true);
+    this.#graph.endDrag(true, node);
+    this.#dragVelocity.set(0, 0, 0);
+    this.#hasDragPoint = false;
     this.#ctx.gesture.setGrabbed(false);
     this.#ctx.gesture.setTether(null);
+    if (thrown && node) {
+      this.#ctx.toast(
+        'info',
+        `Бросок! «${node.label}» улетает в чёрную дыру · разорвано связей: ${this.#requestsOf(node).length}`,
+        { action: { label: 'Вернуть узлы', run: () => this.#releaseAllNodes() } },
+      );
+      return;
+    }
     if (node) {
       const requests = this.#requestsOf(node).length;
       this.#ctx.toast(
         'info',
         `Узел «${node.label}» вырван из цепочки и оставлен · запросов: ${requests} · панель слева показывает их`,
       );
+    }
+  }
+
+  /**
+   * Щипок в пустоте: держим не узел, а саму сцену. Движение руки вращает и наклоняет граф,
+   * поворот кисти доворачивает его вокруг оси взгляда — так сценой можно управлять,
+   * не отпуская щипок и не трогая мышь.
+   */
+  #holdSpace(): void {
+    const roll = this.#ctx.gesture.state.roll;
+    if (this.#spaceHold) {
+      const dx = this.#ndc.x - this.#spaceHold.x;
+      const dy = this.#ndc.y - this.#spaceHold.y;
+      this.#orbit.rotateBy(-dx * SPACE_ROTATE_SPEED, -dy * SPACE_ROTATE_SPEED);
+      const delta = angleDelta(this.#lastSpaceRoll, roll);
+      // Большой скачок — потеря/перехват руки, а не поворот: его игнорируем.
+      if (Math.abs(delta) < 0.7) this.#orbit.rotateBy(delta * 1.1, 0);
+    }
+    this.#lastSpaceRoll = roll;
+    this.#spaceHold = new THREE.Vector2(this.#ndc.x, this.#ndc.y);
+  }
+
+  /**
+   * Вторая рука: свой щипок держит свой орб, рывок — свой бросок. Двумя руками можно
+   * развести два узла и сравнить их запросы (панель показывает последний взятый).
+   */
+  #updateSecondaryHand(dt: number): void {
+    const gesture = this.#ctx.gesture.state;
+    const cursor = gesture.secondaryCursor;
+
+    if (this.#globeActive || !cursor.active) {
+      this.#releaseSecond(true);
+      return;
+    }
+
+    const node = this.#second.node;
+    if (!node) {
+      if (!gesture.secondaryPinch || this.#dragging) return;
+      this.#second.ndc.set(cursor.ndcX, cursor.ndcY);
+      const found = this.#graph.hitTest(this.camera, this.#second.ndc.x, this.#second.ndc.y, GRAB_RADIUS_HAND);
+      // Один и тот же орб двумя руками не тянем: вторая рука берёт только свободный узел.
+      if (!found || this.#graph.grabbedNodes.includes(found)) return;
+      this.#second.node = found;
+      this.#second.velocity.set(0, 0, 0);
+      this.#second.hasLast = false;
+      this.#graph.beginDrag(found);
+      this.#graph.setBoost(found, 1);
+      this.#ctx.gesture.setGrabbed(true);
+      const normal = new THREE.Vector3();
+      this.camera.getWorldDirection(normal);
+      normal.negate();
+      const anchor = new THREE.Vector3(found.x ?? 0, found.y ?? 0, found.z ?? 0);
+      this.#second.plane.setFromNormalAndCoplanarPoint(normal, anchor);
+      const hit = this.#secondOnPlane();
+      if (hit) this.#second.offset.copy(anchor).sub(this.#second.point);
+      else this.#second.offset.set(0, 0, 0);
+      return;
+    }
+
+    if (!gesture.secondaryPinch) {
+      this.#releaseSecond(false);
+      return;
+    }
+
+    this.#second.ndc.set(cursor.ndcX, cursor.ndcY);
+    const hit = this.#secondOnPlane();
+    if (!hit) return;
+    const point = this.#second.point.copy(hit).add(this.#second.offset);
+    if (point.length() > NODE_DRAG_LIMIT) point.setLength(NODE_DRAG_LIMIT);
+    if (this.#second.hasLast && dt > 0.0001) {
+      const instant = this.#tempVec.copy(point).sub(this.#second.last).divideScalar(dt);
+      this.#second.velocity.lerp(instant, Math.min(1, dt * 9));
+    }
+    this.#second.last.copy(point);
+    this.#second.hasLast = true;
+    this.#graph.moveDragged(point, node);
+  }
+
+  /** Луч второй руки × её плоскость перетаскивания. */
+  #secondOnPlane(): THREE.Vector3 | null {
+    this.#raycaster.setFromCamera(this.#second.ndc, this.camera);
+    return this.#raycaster.ray.intersectPlane(this.#second.plane, this.#second.point);
+  }
+
+  /** Отпустить орб второй руки; `quiet` — без броска (рука ушла, сцена вернулась к графу). */
+  #releaseSecond(quiet: boolean): void {
+    const node = this.#second.node;
+    this.#second.node = null;
+    if (!node) return;
+    const speed = this.#second.velocity.length();
+    const thrown = !quiet && speed > THROW_SPEED_MIN ? this.#graph.throwNode(node, this.#second.velocity) : false;
+    this.#graph.setBoost(node, 0);
+    this.#graph.endDrag(true, node);
+    this.#second.velocity.set(0, 0, 0);
+    this.#second.hasLast = false;
+    if (!this.#dragging) this.#ctx.gesture.setGrabbed(false);
+    if (thrown) {
+      this.#ctx.toast('info', `Второй орб «${node.label}» тоже улетел в чёрную дыру`, {
+        action: { label: 'Вернуть узлы', run: () => this.#releaseAllNodes() },
+      });
     }
   }
 
@@ -897,7 +1069,11 @@ export class NetworkScene implements SceneModule {
         : 'в 3D: глобус · нет координат (GeoIP — этап 3)';
       return;
     }
-    this.#panelMode.textContent = `в 3D: ${this.#graph.nodes.length} узлов · ${this.#graph.links.length} рёбер`;
+    // Что пользователь выкинул руками: проглочено дырой и разорвано связей.
+    const eaten = this.#graph.devoured;
+    const severed = this.#graph.severedCount;
+    const extra = eaten || severed ? ` · проглочено ${eaten} · разорвано связей ${severed}` : '';
+    this.#panelMode.textContent = `в 3D: ${this.#graph.nodes.length} узлов · ${this.#graph.links.length} рёбер${extra}`;
   }
 
   #renderPanel(): void {
@@ -927,8 +1103,8 @@ export class NetworkScene implements SceneModule {
         <div class="hud-field-value">запросов: ${requests.length}${breakdown ? ` · ${escapeHtml(breakdown)}` : ''}</div>
         ${
           pinned
-            ? '<div class="hud-label" style="margin-top:6px">вырван из цепочки и оставлен · «Вернуть узлы» снимает закрепление</div>'
-            : '<div class="hud-label" style="margin-top:6px">щипок/зажать — вырвать узел и покрутить кистью; панель покажет его запросы</div>'
+            ? '<div class="hud-label" style="margin-top:6px">вырван из цепочки и оставлен · «Вернуть узлы» возвращает всё</div>'
+            : '<div class="hud-label" style="margin-top:6px">щипок/зажать — вырвать узел и покрутить кистью; рывок при отпускании — выкинуть в чёрную дыру</div>'
         }`;
       const list = document.createElement('div');
       list.className = 'hud-group';
@@ -959,9 +1135,18 @@ export class NetworkScene implements SceneModule {
         list.appendChild(row);
       }
       body.appendChild(list);
+      const hands = document.createElement('div');
+      hands.className = 'hud-label';
+      hands.style.marginTop = '10px';
+      hands.textContent =
+        'Руки: щипок по орбу — вырвать; рывок кистью при отпускании — чёрная дыра проглотит орб ' +
+        'вместе со связями; щипок в пустоте — вращение и наклон сцены (поворот кисти доворачивает); ' +
+        'вторая рука щипком — второй орб; развести руки — масштаб.';
+      body.appendChild(hands);
+
       const hint = document.createElement('div');
       hint.className = 'hud-label';
-      hint.style.marginTop = '10px';
+      hint.style.marginTop = '6px';
       hint.textContent = this.#hasGeoData
         ? 'Кликните соединение в списке — покажу детали; по узлу на глобусе — что за хост'
         : this.#snapshot?.elevated === false

@@ -31,6 +31,7 @@ import { loadMediaPipe } from '../src/core/gesture/mediapipe';
 import { PointerHub } from '../src/core/interaction/pointer';
 import { economyRate } from '../src/core/gesture/rate';
 import { pinchText } from '../src/core/gesture';
+import * as THREE from 'three';
 import { ForceGraph } from '../src/scenes/network/graph';
 import { existsSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -266,7 +267,7 @@ async function main(): Promise<void> {
   check(!moved, 'после возврата ни один узел не закреплён');
   inspectGraph.dispose();
 
-  console.log('Сеть: соединения выдёргиваются вместе с узлом (резинка)');
+  console.log('Сеть: соединения выдёргиваются вместе с узлом (резинка и обрыв)');
   const rubberGraph = new ForceGraph();
   rubberGraph.sync(inspectConnections);
   for (let frame = 0; frame < 120; frame++) rubberGraph.update(1 / 60, frame / 60, null);
@@ -279,9 +280,9 @@ async function main(): Promise<void> {
   rubberGraph.setBoost(centre, 1);
   for (let frame = 0; frame < 20; frame++) rubberGraph.update(1 / 60, frame / 60, null);
 
-  // Уводим узел далеко: точка крепления соединений должна остаться позади (вялая резинка).
-  const away = { x: 60, y: 40, z: 30 };
-  rubberGraph.moveDragged(away as unknown as Parameters<typeof rubberGraph.moveDragged>[0]);
+  // Уводим узел далеко: точка крепления соединений остаётся позади (вялая резинка).
+  const away = new THREE.Vector3(60, 40, 30);
+  rubberGraph.moveDragged(away);
   rubberGraph.update(1 / 60, 0.5, null);
   const lag = Math.hypot(
     (attached[0].rab?.x ?? away.x) - away.x,
@@ -290,27 +291,106 @@ async function main(): Promise<void> {
   );
   check(lag > 5, `соединения отстают от узла — линия тянется (отставание ${lag.toFixed(1)})`);
 
-  // Через ~2 секунды линия затягивается в орб: схлопывается и гаснет.
-  for (let frame = 0; frame < 140; frame++) rubberGraph.update(1 / 60, 0.6 + frame / 60, null);
+  // Отпустили рано (линия ещё не всосалась): соединения выкатываются обратно к узлу.
+  rubberGraph.setBoost(centre, 0);
+  rubberGraph.endDrag(true, centre);
+  for (let frame = 0; frame < 30; frame++) rubberGraph.update(1 / 60, 1.2 + frame / 60, null);
+  check(attached.every((link) => (link.absorb ?? 0) === 0), 'отпустили рано — линии выкатились обратно');
+  check(attached.every((link) => rubberGraph.links.includes(link)), 'связи на месте, пока их не вырвали до конца');
+
+  // Держим долго: линия всосалась в орб и РВЁТСЯ — соединение уходит вместе с узлом.
+  rubberGraph.beginDrag(centre);
+  rubberGraph.setBoost(centre, 1);
+  rubberGraph.moveDragged(away);
+  for (let frame = 0; frame < 200; frame++) rubberGraph.update(1 / 60, 2 + frame / 60, null);
+  check(rubberGraph.severedCount > 0, `связи вырваны из цепочки (${rubberGraph.severedCount})`);
+  check(attached.every((link) => !rubberGraph.links.includes(link)), 'разорванные линии ушли из графа');
+  check(rubberGraph.nodes.includes(centre), 'сам узел остался: он вырван, но живёт в сцене');
+
+  // Новый снимок сети не возвращает разорванные связи — пока не нажали «Вернуть узлы».
+  rubberGraph.sync(inspectConnections);
   check(
-    attached.every((link) => (link.absorb ?? 0) > 0.9),
-    `соединения затянулись в орб (absorb ${(attached[0].absorb ?? 0).toFixed(2)})`,
+    rubberGraph.links.filter((link) => link.source === centre || link.target === centre).length === 0,
+    'разорванные связи не воссоздаются новым снимком',
+  );
+  rubberGraph.unpinAll();
+  rubberGraph.sync(inspectConnections);
+  const restored = rubberGraph.links.filter((link) => link.source === centre || link.target === centre);
+  check(restored.length === attached.length, `«Вернуть узлы» восстановила связи (${restored.length})`);
+  check(rubberGraph.severedCount === 0, 'счётчик разорванных связей сброшен');
+  rubberGraph.dispose();
+
+  console.log('Сеть: чёрная дыра — выбросить орб руками');
+  const holeGraph = new ForceGraph();
+  holeGraph.sync(inspectConnections);
+  for (let frame = 0; frame < 120; frame++) holeGraph.update(1 / 60, frame / 60, null);
+  check(holeGraph.hole.object.children.length >= 6, `дыра собрана из деталей (${holeGraph.hole.object.children.length})`);
+  check(!holeGraph.hole.alive, 'чёрная дыра закрыта, пока никто ничего не выбрасывал');
+
+  const localNode = holeGraph.nodes.find((node) => node.kind === 'local')!;
+  const velocity = new THREE.Vector3(90, 20, -40);
+  check(!holeGraph.throwNode(localNode, velocity), 'саму машину выбросить нельзя');
+
+  const orb = holeGraph.nodes.find((node) => node.kind === 'remote')!;
+  const orbLinks = holeGraph.links.filter((link) => link.source === orb || link.target === orb);
+  check(orbLinks.length > 0, `у хоста «${orb.label}» есть связи (${orbLinks.length})`);
+
+  check(holeGraph.throwNode(orb, velocity), 'бросок принят: орб улетает');
+  check(holeGraph.hole.alive, 'чёрная дыра раскрылась на броске');
+  const holeDistance = (): number =>
+    Math.hypot(
+      (orb.x ?? 0) - holeGraph.hole.position.x,
+      (orb.y ?? 0) - holeGraph.hole.position.y,
+      (orb.z ?? 0) - holeGraph.hole.position.z,
+    );
+  const distanceAtThrow = holeDistance();
+  for (let frame = 0; frame < 30; frame++) holeGraph.update(1 / 60, 1 + frame / 60, null);
+  check(holeDistance() < distanceAtThrow, `орб затягивает: ${distanceAtThrow.toFixed(0)} → ${holeDistance().toFixed(0)}`);
+  check(holeGraph.hole.radius > 1, `дыра набрала размер (${holeGraph.hole.radius.toFixed(1)})`);
+
+  // Летим, пока узел не уйдёт за горизонт, и следим за разрывом связей.
+  let cutSeen = false;
+  for (let frame = 0; frame < 400 && holeGraph.nodes.includes(orb); frame++) {
+    holeGraph.update(1 / 60, 1.5 + frame / 60, null);
+    if (orbLinks.some((link) => link.cut !== undefined)) cutSeen = true;
+  }
+  check(cutSeen, 'в момент поглощения связи рвутся — у линии появляется точка обрыва');
+  check(!holeGraph.nodes.includes(orb), 'орб проглочен: узел исчез из графа');
+  check(holeGraph.devoured === 1, `панель сцены видит поглощение (${holeGraph.devoured})`);
+  check(
+    orbLinks.every((link) => !holeGraph.links.includes(link)),
+    'связи выкинутого орба ушли вместе с ним',
+  );
+  for (let frame = 0; frame < 140; frame++) holeGraph.update(1 / 60, 9 + frame / 60, null);
+  check(!holeGraph.hole.alive, 'дыра схлопнулась, когда орб исчез');
+
+  holeGraph.sync(inspectConnections);
+  check(!holeGraph.nodes.includes(orb), 'новый снимок сети не возвращает проглоченный орб');
+  holeGraph.unpinAll();
+  holeGraph.sync(inspectConnections);
+  check(
+    holeGraph.nodes.some((node) => node.id === orb.id),
+    '«Вернуть узлы» оживила проглоченный орб',
   );
   check(
-    attached.every((link) => (link.alpha ?? 1) < 0.1),
-    `линии в орбе погасли (alpha ${(attached[0].alpha ?? 1).toFixed(2)})`,
+    holeGraph.links.filter((link) => link.source.id === orb.id || link.target.id === orb.id).length ===
+      orbLinks.length,
+    'связи вернулись вместе с орбом',
   );
 
-  // Отпускаем: линии выкатываются обратно к своим узлам.
-  rubberGraph.setBoost(centre, 0);
-  rubberGraph.endDrag(true);
-  for (let frame = 0; frame < 60; frame++) rubberGraph.update(1 / 60, 3.5 + frame / 60, null);
+  // Две руки: каждый щипок держит свой орб.
+  const twoHands = holeGraph.nodes.filter((node) => node.kind !== 'local').slice(0, 2);
+  holeGraph.beginDrag(twoHands[0]);
+  holeGraph.beginDrag(twoHands[1]);
+  check(holeGraph.grabbedCount === 2, `двумя руками держим два орба (${holeGraph.grabbedCount})`);
+  holeGraph.endDrag(true, twoHands[0]);
   check(
-    attached.every((link) => (link.absorb ?? 0) === 0 && (link.alpha ?? 0) === 1),
-    'после отпускания соединения вернулись (линии снова видны)',
+    holeGraph.grabbedCount === 1 && holeGraph.dragged === twoHands[1],
+    'отпустили один орб — второй остался в руке',
   );
-  check(attached[0].orb === undefined, 'состояние резинки сброшено');
-  rubberGraph.dispose();
+  holeGraph.endDrag(true, twoHands[1]);
+  check(holeGraph.grabbedCount === 0, 'обе руки свободны');
+  holeGraph.dispose();
 
   console.log('Жесты: калибровка щипка под конкретную руку');
   // «Далёкая или шумная» рука: раскрытая кисть даёт отношение ~1.0, а неглубокий щипок — 0.46.
