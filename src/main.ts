@@ -41,6 +41,9 @@ class App implements AppHost {
   #booted = false;
   #lastGestureStatus = '';
   #lastTwoHandScale = 1;
+  /** Когда жесты включились — от этого считаем «руку долго не видно». */
+  #handsSince = 0;
+  #handsHintShown = false;
 
   constructor(canvas: HTMLCanvasElement, outputMode: boolean, params: URLSearchParams) {
     this.outputMode = outputMode;
@@ -207,10 +210,42 @@ class App implements AppHost {
     this.gesture.setPaused(document.hidden);
   }
 
+  /**
+   * Если рука не попадала в кадр несколько секунд, показываем превью камеры: обычная причина
+   * «жесты не работают» — рука вне кадра (слишком близко, сбоку, камера смотрит не туда).
+   * Превью сразу отвечает на вопрос «камера меня вообще видит?».
+   */
+  #maybeOfferCameraPreview(): void {
+    if (this.outputMode || this.#handsHintShown) return;
+    if (!this.gesture.enabled) return;
+    if (this.#handsSince === 0) {
+      this.#handsSince = performance.now();
+      return;
+    }
+    if (this.gesture.state.handsCount > 0) {
+      this.#handsHintShown = true;
+      return;
+    }
+    if (performance.now() - this.#handsSince < 8000) return;
+
+    this.#handsHintShown = true;
+    if (this.prefs.get().handShowPreview) return;
+    this.#hud.toast('warn', 'Камера не видит кисть уже 8 секунд — включить превью камеры?', {
+      action: {
+        label: 'Показать превью',
+        run: () => {
+          this.prefs.set({ handShowPreview: true });
+          this.#hud.toast('info', 'Держите раскрытую кисть в 40–80 см от камеры, ладонью к ней');
+        },
+      },
+    });
+  }
+
   #syncGestureStatus(): void {
     if (this.outputMode) return;
     const status = this.gesture.status;
     const state = this.gesture.state;
+    this.#maybeOfferCameraPreview();
     const text = this.gesture.enabled
       ? `${statusLabel(status)}${state.handsCount > 0 ? ` · рук: ${state.handsCount}` : ''}${
           state.pose !== 'none' ? ` · ${poseLabel(state.pose)}` : ''
