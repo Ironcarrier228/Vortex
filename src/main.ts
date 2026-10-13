@@ -160,8 +160,16 @@ class App implements AppHost {
         );
       }
       if (status.phase === 'error' && this.#lastGestureStatus !== 'error') {
+        // Главное действие — «Повторить»: чаще всего камеру держало другое приложение,
+        // и достаточно освободить устройство. Настройки открываются, если это не помогло.
         this.#hud.toast('error', `Жесты недоступны: ${status.message ?? 'ошибка'}`, {
-          action: { label: 'Открыть настройки', run: () => this.#hud.openSettings() },
+          action: {
+            label: 'Повторить',
+            run: () => {
+              this.#hud.toast('info', 'Пробую запустить камеру снова…');
+              this.gesture.retry();
+            },
+          },
         });
       }
       this.#lastGestureStatus = status.phase;

@@ -34,6 +34,37 @@ const WASM_CDN = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@1.1.0/was
  */
 const HAND_CONFIDENCE = 0.35;
 
+/** Сколько раз пробуем поднять камеру при «занято» и с какими паузами (мс). */
+const CAMERA_ATTEMPTS = 3;
+const CAMERA_RETRY_MS = [350, 900];
+
+/**
+ * Ошибка запуска камеры с указанием шага. Шаг нужен для честного сообщения: «запрос
+ * прерван» (устройство занято) и «показ потока прерван» — разные причины и разные советы.
+ */
+export class CameraStepError extends Error {
+  /** `cause` совпадает с полем базового `Error`, поэтому `override`. */
+  constructor(
+    readonly step: 'request' | 'play' | 'frames',
+    override readonly cause: unknown,
+  ) {
+    super(cause instanceof Error ? cause.message : String(cause));
+    this.name = cause instanceof DOMException ? cause.name : cause instanceof Error ? cause.name : 'Error';
+  }
+}
+
+/**
+ * Прерванный или занятый запуск камеры: `AbortError` (устройство занято/запуск отменён),
+ * `NotReadableError` (камеру держит другой процесс) и старый `TrackStartError`.
+ * Это лечится повтором — в отличие от отказа доступа или отсутствия устройства.
+ */
+export function isTransientCameraError(err: unknown): boolean {
+  const name = err instanceof DOMException ? err.name : err instanceof Error ? err.name : '';
+  return name === 'AbortError' || name === 'NotReadableError' || name === 'TrackStartError';
+}
+
+const delay = (ms: number) => new Promise<void>((resolve) => window.setTimeout(resolve, ms));
+
 
 export class CameraHandSource implements HandSource {
   readonly kind = 'camera' as const;
@@ -69,6 +100,8 @@ export class CameraHandSource implements HandSource {
   #watchdog = 0;
   /** Сколько секунд камера молчит (readyState < 2) — для честной ошибки. */
   #silentSince = 0;
+  /** Пометка «выбранная камера не поднялась, взял по умолчанию» — показывается в статусе. */
+  #fallbackNote = '';
 
   constructor(options: { deviceId?: string } = {}) {
     this.#deviceId = options.deviceId ?? '';
@@ -140,8 +173,11 @@ export class CameraHandSource implements HandSource {
       this.#startWatchdog();
     } catch (err) {
       this.#running = false;
-      this.#setStatus({ phase: 'error', message: describeError(err) });
       this.#teardownHardware();
+      // Пока камера поднималась, жесты выключили (или переключили источник) — это отмена,
+      // а не поломка: молчим, иначе пользователь видит «ошибку» после своего же действия.
+      if (this.#stopped) return;
+      this.#setStatus({ phase: 'error', message: describeError(err) });
     }
   }
 
@@ -190,8 +226,8 @@ export class CameraHandSource implements HandSource {
       video.cancelVideoFrameCallback?.(this.#videoCallbackId);
       this.#videoCallbackId = 0;
     }
-    this.#stream?.getTracks().forEach((track) => track.stop());
-    this.#stream = null;
+    this.#releaseStream();
+    this.#fallbackNote = '';
     if (this.#video) {
       this.#video.srcObject = null;
       this.#video.remove();
@@ -202,6 +238,12 @@ export class CameraHandSource implements HandSource {
     this.#gpuCanvas?.remove();
     this.#gpuCanvas = null;
     this.#lastTimestamp = -1;
+  }
+
+  /** Освободить текущий поток: треки останавливаем до нового запроса к камере. */
+  #releaseStream(): void {
+    this.#stream?.getTracks().forEach((track) => track.stop());
+    this.#stream = null;
   }
 
   /** WASM-набор: сначала локальная копия, затем CDN. */
@@ -288,21 +330,40 @@ export class CameraHandSource implements HandSource {
     }
   }
 
+  /**
+   * Открыть камеру. Три вещи, без которых получался `AbortError` и «камера не работает»:
+   *  1. прошлый поток освобождаем **до** нового запроса (занятое устройство = отказ запуска);
+   *  2. на «занято» (`AbortError`/`NotReadableError`) повторяем запрос — камера часто
+   *     освобождается через доли секунды;
+   *  3. если не поднялась выбранная камера — берём камеру по умолчанию, но честно об этом пишем.
+   */
   async #openCamera(): Promise<HTMLVideoElement> {
     if (!navigator.mediaDevices?.getUserMedia) {
-      throw new Error('браузерное окружение не даёт доступ к камере (getUserMedia)');
+      throw new CameraStepError('request', new Error('браузерное окружение не даёт доступ к камере (getUserMedia)'));
     }
-    const stream = await navigator.mediaDevices.getUserMedia({
-      audio: false,
-      video: {
-        ...(this.#deviceId ? { deviceId: { exact: this.#deviceId } } : { facingMode: 'user' }),
-        width: { ideal: 640 },
-        height: { ideal: 480 },
-        frameRate: { ideal: 30, max: 60 },
-      },
-    });
-    // Прошлый поток закрываем здесь же: иначе камера остаётся занятой (NotReadableError).
-    this.#stream?.getTracks().forEach((track) => track.stop());
+    this.#releaseStream();
+
+    const base: MediaTrackConstraints = {
+      width: { ideal: 640 },
+      height: { ideal: 480 },
+      frameRate: { ideal: 30, max: 60 },
+    };
+
+    let stream: MediaStream;
+    try {
+      stream = await this.#requestStream(
+        this.#deviceId ? { ...base, deviceId: { exact: this.#deviceId } } : { ...base, facingMode: 'user' },
+      );
+      this.#fallbackNote = '';
+    } catch (err) {
+      // Выбранная камера не поднялась, а стандартная может: лучше работающие жесты
+      // и честная пометка в статусе, чем «AbortError» и выключенное управление.
+      const cause = err instanceof CameraStepError ? err.cause : err;
+      if (!this.#deviceId || !isTransientCameraError(cause)) throw err;
+      console.warn('[gesture] выбранная камера не поднялась — беру камеру по умолчанию:', err);
+      this.#fallbackNote = 'выбранная камера не поднялась, взял камеру по умолчанию';
+      stream = await this.#requestStream({ ...base, facingMode: 'user' });
+    }
     this.#stream = stream;
 
     const video = document.createElement('video');
@@ -326,7 +387,21 @@ export class CameraHandSource implements HandSource {
     this.#video = video;
     document.body.appendChild(video);
     stale?.remove();
-    await video.play();
+
+    // `play()` тоже умеет `AbortError` (поток подменили или элемент пересоздали):
+    // одна короткая попытка повтора лечит это без пугающего сообщения пользователю.
+    try {
+      await video.play();
+    } catch (err) {
+      if (!isTransientCameraError(err)) throw new CameraStepError('play', err);
+      console.warn('[gesture] показ потока прерван, повторяю play():', err);
+      await delay(120);
+      try {
+        await video.play();
+      } catch (retry) {
+        throw new CameraStepError('play', retry);
+      }
+    }
     // Ждём метаданные: без них videoWidth = 0, и модель получит пустой кадр.
     this.#silentSince = performance.now();
     await new Promise<void>((resolve) => {
@@ -338,6 +413,30 @@ export class CameraHandSource implements HandSource {
       });
     });
     return video;
+  }
+
+  /**
+   * Запрос потока у камеры с повторами при «занято». Между попытками пишем в статус, что
+   * происходит, — пользователь видит «камера занята — попытка 2 из 3», а не пустоту.
+   */
+  async #requestStream(constraints: MediaTrackConstraints): Promise<MediaStream> {
+    let lastError: unknown;
+    for (let attempt = 1; attempt <= CAMERA_ATTEMPTS; attempt++) {
+      if (this.#stopped) throw new CameraStepError('request', new DOMException('запуск отменён', 'AbortError'));
+      try {
+        return await navigator.mediaDevices.getUserMedia({ audio: false, video: constraints });
+      } catch (err) {
+        lastError = err;
+        if (!isTransientCameraError(err) || attempt === CAMERA_ATTEMPTS) break;
+        this.#setStatus({
+          ...this.status,
+          phase: 'starting-camera',
+          message: `камера занята — попытка ${attempt + 1} из ${CAMERA_ATTEMPTS}`,
+        });
+        await delay(CAMERA_RETRY_MS[attempt - 1] ?? 1200);
+      }
+    }
+    throw new CameraStepError('request', lastError);
   }
 
   /**
@@ -467,6 +566,7 @@ export class CameraHandSource implements HandSource {
       this.#setStatus({
         ...this.status,
         phase: 'running',
+        message: this.#fallbackNote ? `распознавание идёт · ${this.#fallbackNote}` : 'распознавание идёт',
         fps: this.#fpsEma,
         frames: this.#frames,
         darkness: this.#darkness >= 0 ? this.#darkness : undefined,
@@ -523,23 +623,36 @@ export async function listCameras(): Promise<{ id: string; label: string }[]> {
   }
 }
 
-/** Понятные сообщения вместо «NotAllowedError». */
-function describeError(err: unknown): string {
-  if (err instanceof DOMException) {
-    switch (err.name) {
-      case 'NotAllowedError':
-        return 'доступ к камере запрещён — разрешите его в настройках Windows/браузера';
-      case 'NotFoundError':
-      case 'DevicesNotFoundError':
-        return 'камера не найдена';
-      case 'NotReadableError':
-        return 'камера занята другим приложением';
-      case 'OverconstrainedError':
-        return 'камера не поддерживает нужный формат';
-      default:
-        return `ошибка камеры: ${err.name}`;
-    }
+/**
+ * Понятные сообщения вместо «AbortError». Шаг запуска важен: «запрос прерван» (камера
+ * занята или запуск отменён) и «показ потока прерван» — разные причины и разные советы.
+ * Функция экспортируется, чтобы сообщения проверялись тестами, а не глазами.
+ */
+export function describeError(err: unknown): string {
+  const cause = err instanceof CameraStepError ? err.cause : err;
+  const step = err instanceof CameraStepError ? err.step : null;
+  const name = cause instanceof DOMException ? cause.name : cause instanceof Error ? cause.name : '';
+
+  switch (name) {
+    case 'AbortError':
+      return step === 'play'
+        ? 'камера отдала поток, но показ прервался (play прерван) — включите жесты ещё раз'
+        : 'камера не запустилась: устройство занято — его держит другое приложение ' +
+            '(«Камера», Teams, Zoom, антивирус) или прежний запуск. Закройте его и нажмите «Повторить»';
+    case 'NotReadableError':
+      return 'камера занята другим приложением — закройте его и нажмите «Повторить»';
+    case 'NotAllowedError':
+      return 'доступ к камере запрещён — разрешите его в настройках Windows/браузера и нажмите «Повторить»';
+    case 'NotFoundError':
+    case 'DevicesNotFoundError':
+      return 'камера не найдена — подключите её или выберите «Демо-руку» в настройках';
+    case 'OverconstrainedError':
+      return 'камера не поддерживает нужный формат — выберите другое устройство в настройках';
+    case 'NotSupportedError':
+      return 'браузер не поддерживает доступ к камере (нужен https или приложение Tauri)';
+    default:
+      break;
   }
-  if (err instanceof Error) return err.message;
-  return String(err);
+  if (cause instanceof Error) return cause.message;
+  return String(cause);
 }

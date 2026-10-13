@@ -40,6 +40,8 @@ export class GestureService {
   #enabled = false;
   #paused = false;
   #starting = false;
+  /** Когда начался текущий запуск: по нему «Повторить» не залипает на зависшей попытке. */
+  #startingAt = 0;
   /** Камера не далась (нет устройства, запрет доступа) — показываем демо-руку. */
   #autoDemo = false;
   #demoReason = '';
@@ -168,6 +170,19 @@ export class GestureService {
     });
   }
 
+  /**
+   * Повторить запуск камеры (кнопка «Повторить» в тосте об ошибке). Нужно после того как
+   * пользователь закрыл приложение, державшее камеру: устройство освободилось — пробуем снова.
+   */
+  retry(): void {
+    if (!this.#enabled) return;
+    this.#autoDemo = false;
+    this.#demoReason = '';
+    // Зависшую прошлую попытку не ждём: сбрасываем флаг, источник пересоздастся.
+    if (performance.now() - this.#startingAt > 20_000) this.#starting = false;
+    void this.#startSource();
+  }
+
   /** Камеры для настроек (метки устройств доступны после выдачи разрешения). */
   static listCameras(): Promise<{ id: string; label: string }[]> {
     return listCameras();
@@ -209,8 +224,11 @@ export class GestureService {
   }
 
   async #startSource(): Promise<void> {
-    if (this.#starting) return;
+    // Если прошлая попытка висит слишком долго (камера не отвечает вовсе), она больше не
+    // должна блокировать новую: пользователь нажимает «Повторить» и ждёт результат.
+    if (this.#starting && performance.now() - this.#startingAt < 20_000) return;
     this.#starting = true;
+    this.#startingAt = performance.now();
     this.#teardownSource();
 
     const prefs = this.#prefs.get();
@@ -237,6 +255,8 @@ export class GestureService {
       this.#demoReason = '';
       this.#autoDemo = false;
     } catch (err) {
+      // Жесты выключили, пока камера поднималась: это отмена, а не поломка.
+      if (!this.#enabled) return;
       const message = err instanceof Error ? err.message : String(err);
 
       // Камера/модель не дались — не оставляем пользователя с пустым экраном и непонятной

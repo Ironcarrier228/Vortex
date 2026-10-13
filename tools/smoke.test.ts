@@ -31,6 +31,7 @@ import { loadMediaPipe } from '../src/core/gesture/mediapipe';
 import { PointerHub } from '../src/core/interaction/pointer';
 import { economyRate } from '../src/core/gesture/rate';
 import { frameInfo, hintForStatus, pinchText } from '../src/core/gesture';
+import { CameraStepError, describeError, isTransientCameraError } from '../src/core/gesture/handTracker';
 import * as THREE from 'three';
 import { ForceGraph } from '../src/scenes/network/graph';
 import { existsSync, readFileSync } from 'node:fs';
@@ -886,6 +887,47 @@ async function main(): Promise<void> {
   check(
     hintForStatus({ phase: 'starting-camera' })?.includes('Демо') === true,
     'пока камера поднимается, подсказка говорит про демо-режим',
+  );
+
+  console.log('Жесты: ошибки камеры (AbortError и другие) — понятно, что делать');
+  const abortRequest = new CameraStepError('request', new DOMException('запуск камеры отменён', 'AbortError'));
+  const abortPlay = new CameraStepError('play', new DOMException('play() прерван', 'AbortError'));
+  check(
+    describeError(abortRequest).includes('занято') && describeError(abortRequest).includes('Повторить'),
+    `AbortError при запросе объясняет причину и предлагает повтор: «${describeError(abortRequest)}»`,
+  );
+  check(
+    describeError(abortPlay).includes('показ') && !describeError(abortPlay).includes('занято'),
+    `AbortError при показе потока — отдельное сообщение: «${describeError(abortPlay)}»`,
+  );
+  check(
+    describeError(new DOMException('нет доступа', 'NotAllowedError')).includes('разрешите'),
+    'запрет доступа — понятный совет',
+  );
+  check(
+    describeError(new DOMException('занята', 'NotReadableError')).includes('Повторить'),
+    'занятое устройство — предлагаем повторить',
+  );
+  check(
+    describeError(new DOMException('пусто', 'NotFoundError')).includes('не найдена'),
+    'нет устройства — так и говорим',
+  );
+  check(
+    describeError(new Error('браузерное окружение не даёт доступ к камере')) ===
+      'браузерное окружение не даёт доступ к камере',
+    'прочие ошибки не подменяются общими словами',
+  );
+  check(
+    isTransientCameraError(new DOMException('', 'AbortError')) &&
+      isTransientCameraError(new DOMException('', 'NotReadableError')) &&
+      isTransientCameraError(new DOMException('', 'TrackStartError')),
+    'AbortError/NotReadableError/TrackStartError считаются временными — их повторяем',
+  );
+  check(
+    !isTransientCameraError(new DOMException('', 'NotAllowedError')) &&
+      !isTransientCameraError(new DOMException('', 'NotFoundError')) &&
+      !isTransientCameraError(new DOMException('', 'OverconstrainedError')),
+    'запрет доступа и отсутствие камеры повторами не лечатся — не пытаемся',
   );
 
   console.log('Жесты: экономный режим (общая частота с рендером)');
