@@ -15,6 +15,7 @@
     "check": "npm run typecheck && npm run smoke",
     "sync:mediapipe": "node tools/sync-mediapipe.mjs",
     "fetch:models": "node tools/fetch_models.mjs",
+    "postinstall": "node tools/sync-mediapipe.mjs",
     "tauri": "tauri",
     "app:dev": "tauri dev",
     "app:build": "tauri build"

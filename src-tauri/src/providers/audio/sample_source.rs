@@ -42,14 +42,6 @@ impl MonoMixer {
         }
     }
 
-    pub fn channels(&self) -> usize {
-        self.channels
-    }
-
-    pub fn kind(&self) -> SampleKind {
-        self.kind
-    }
-
     /// Сконвертировать интерлив-буфер в моно f32 и дописать в `out`.
     pub fn to_mono_into(&self, bytes: &[u8], out: &mut Vec<f32>) {
         let bps = self.bytes_per_sample;
